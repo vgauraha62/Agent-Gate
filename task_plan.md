@@ -53,3 +53,10 @@ agentgate/
 | Decision | Rationale |
 |----------|-----------|
 | | |
+
+## Phase 5: Day 2 - Core Data Structures \& Memory Management (Incomplete)
+- [ ] Implement custom arena allocator in `src/memory.zig`
+- [ ] Implement zeroizing secret container in `src/secret.zig`
+- [ ] Implement Agent context structure in `src/agent.zig`
+- [ ] Write memory safety tests
+

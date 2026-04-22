@@ -1,0 +1,18 @@
+# Zig build cache
+.zig-cache/
+
+# Build output (install prefix)
+zig-out/
+
+# Dependencies (downloaded by zig)
+dependencies/
+
+# Editor and IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
