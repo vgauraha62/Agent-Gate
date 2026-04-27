@@ -1,0 +1,10 @@
+PRD.md
+task_plan.md
+progress.md
+THREAT_MODEL.md
+README.md
+findings.md
+ARCHITECTURE.md
+docs/plans/2026-04-22-002-feat-day3-jwt-authentication-plan.md
+docs/plans/2026-04-22-001-feat-day2-core-data-structures-plan.md
+docs/plans/2026-04-23-001-feat-policy-engine-foundation-plan.md
