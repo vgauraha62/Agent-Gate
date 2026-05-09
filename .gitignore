@@ -1,7 +1,7 @@
-# Zig build cache
+# Zig build cache (per-project)
 .zig-cache/
 
-# Build output (install prefix)
+# Build output (binaries and artifacts)
 zig-out/
 
 # Dependencies (downloaded by zig)
@@ -12,7 +12,30 @@ dependencies/
 .vscode/
 *.swp
 *.swo
-
-# OS
 .DS_Store
-Thumbs.db
+
+# GPG keys (never commit)
+my-gpg-key1.asc
+
+# Analysis and tracking files
+analysis_minimax.md
+commands.txt
+commands_analysis.txt
+progress.md
+task_plan.md
+findings.md
+test_script.txt
+*_summary.txt
+STORAGE_STATUS.txt
+
+# Day tracking folders
+day5/
+home/
+project/
+PENDING_REPORTS/
+
+# Graphify output
+graphify-out/
+
+# Zig global cache (cross-project)
+# ~/.cache/zig/

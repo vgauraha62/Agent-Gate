@@ -434,11 +434,12 @@ test "Condition methods empty array" {
 }
 
 test "Condition methods single element" {
-    const ctx = RequestContext.init("agent", "/api/test", .POST);
+    const ctx_post = RequestContext.init("agent", "/api/test", .POST);
+    const ctx_get = RequestContext.init("agent", "/api/test", .GET);
     const methods = &[_]Method{.POST};
 
-    try std.testing.expect((Condition{ .methods = methods }).matches(&ctx));
-    try std.testing.expect(!(Condition{ .methods = methods }).matches(&ctx));
+    try std.testing.expect((Condition{ .methods = methods }).matches(&ctx_post));
+    try std.testing.expect(!(Condition{ .methods = methods }).matches(&ctx_get));
 }
 
 test "Policy empty conditions" {

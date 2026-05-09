@@ -4,6 +4,8 @@
 
 const std = @import("std");
 const Secret = @import("secret.zig").Secret;
+const Config = @import("config.zig").Config;
+const Command = @import("config.zig").Command;
 
 /// Permission flags for agent access control.
 pub const Permission = enum(u64) {

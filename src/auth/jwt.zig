@@ -166,7 +166,7 @@ fn parsePayload(json_bytes: []const u8) !Payload {
 
     // Required: exp
     const exp = if (obj.get("exp")) |v|
-        if (v == .integer) @intCast(v.integer) else return error.InvalidPayload
+        if (v == .integer) v.integer else return error.InvalidPayload
     else
         return error.InvalidPayload;
 
@@ -220,36 +220,6 @@ fn verifySignature(
     @memcpy(signing_input[0..encoded_header.len], encoded_header);
     signing_input[encoded_header.len] = '.';
     @memcpy(signing_input[encoded_header.len + 1 ..], encoded_payload);
-
-    // Compute expected HMAC
-    var expected_sig: [64]u8 = undefined;
-    const actual_sig_len = switch (algo) {
-        .sha256 => std.crypto.auth.hmac.sha256(
-            &expected_sig,
-            signing_input,
-            secret.asBytes(),
-        ),
-        .sha384 => std.crypto.auth.hmac.sha384(
-            &expected_sig,
-            signing_input,
-            secret.asBytes(),
-        ),
-        .sha512 => std.crypto.auth.hmac.sha512(
-            &expected_sig,
-            signing_input,
-            secret.asBytes(),
-        ),
-    };
-
-    // Constant-time comparison
-    return secureCompare(expected_sig[0..actual_sig_len], signature);
-}
-    const algo = header.hashAlgorithm();
-    const expected_sig_len = algo.signatureLength();
-
-    if (signature.len != expected_sig_len) {
-        return error.InvalidSignature;
-    }
 
     // Compute expected HMAC
     var expected_sig: [64]u8 = undefined;
@@ -592,7 +562,7 @@ test "JWT verify - tampered payload" {
     defer gpa.free(token);
 
     // Tamper with payload (find and modify a character)
-    var tampered = gpa.dupe(u8, token).catch unreachable;
+    const tampered = try gpa.dupe(u8, token);
     defer gpa.free(tampered);
 
     // Find second dot (start of signature) and modify payload before it
