@@ -23,12 +23,11 @@ pub fn main() !void {
 
     var mode = http.ServerMode.async_epoll;
 
-    var args = std.process.argsWithAllocator(allocator) catch |err| {
-        std.debug.print("[Startup] Failed to get args: {}, using default mode\n", .{err});
-        return;
-    };
+    // Parse command line arguments (Zig 0.13+ compatible)
+    var args = std.process.argsWithAllocator(allocator) catch unreachable;
     defer args.deinit();
-
+    // Skip first arg (program name)
+    _ = args.next(); // skip program name
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--sync")) {
             mode = http.ServerMode.sync_posix;

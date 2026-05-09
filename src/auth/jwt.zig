@@ -108,29 +108,113 @@ pub const JWT = struct {
     }
 };
 
-/// Base64URL decoder instance.
-const base64_url = std.base64.Base64UrlNoPadding;
-
-/// Decode base64url string into arena.
+/// Decode base64url string into arena (Zig 0.15+ compatible)
 fn base64UrlDecode(input: []const u8, arena: *SecurityArena) ![]u8 {
     if (input.len == 0) return error.InvalidBase64;
 
-    // Calculate output size
+    // Calculate output size: 3 bytes per 4 chars (roughly)
     const max_output_size = (input.len * 3 + 3) / 4;
-    const output = try arena.alloc(u8, max_output_size);
+    const output = try arena.alloc(max_output_size);
 
-    // Decode
-    const decoded_len = try base64_url.Decoder.calcSizeForSlice(input);
-    const actual_output = output[0..decoded_len];
+    // Custom base64url decode (URL-safe alphabet: A-Z, a-z, 0-9, -, _)
+    var decoded_len: usize = 0;
+    var buffer: [4]u8 = undefined;
+    var buf_idx: usize = 0;
 
-    try base64_url.Decoder.decode(actual_output, input);
+    for (input) |byte| {
+        var value: u8 = undefined;
 
-    return actual_output;
+        if (byte >= 'A' and byte <= 'Z') {
+            value = byte - 'A';
+        } else if (byte >= 'a' and byte <= 'z') {
+            value = byte - 'a' + 26;
+        } else if (byte >= '0' and byte <= '9') {
+            value = byte - '0' + 52;
+        } else if (byte == '-') {
+            value = 62;
+        } else if (byte == '_') {
+            value = 63;
+        } else if (byte == '=') {
+            continue; // Padding - skip
+        } else {
+            return error.InvalidBase64;
+        }
+
+        buffer[buf_idx] = value;
+        buf_idx += 1;
+
+        if (buf_idx == 4) {
+            output[decoded_len] = (buffer[0] << 2) | (buffer[1] >> 4);
+            output[decoded_len + 1] = (buffer[1] << 4) | (buffer[2] >> 2);
+            output[decoded_len + 2] = (buffer[2] << 6) | buffer[3];
+            decoded_len += 3;
+            buf_idx = 0;
+        }
+    }
+
+    // Handle remaining bytes
+    if (buf_idx > 0) {
+        if (buf_idx >= 2) {
+            output[decoded_len] = (buffer[0] << 2) | (buffer[1] >> 4);
+            decoded_len += 1;
+        }
+        if (buf_idx >= 3) {
+            output[decoded_len] = (buffer[1] << 4) | (buffer[2] >> 2);
+            decoded_len += 1;
+        }
+    }
+
+    return output[0..decoded_len];
+}
+
+/// Encode bytes to base64url string (Zig 0.15+ compatible)
+fn base64UrlEncode(input: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    const output_len = ((input.len + 2) / 3) * 4;
+    const output = try allocator.alloc(u8, output_len);
+
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    var idx: usize = 0;
+    var i: usize = 0;
+
+    while (i + 3 <= input.len) {
+        const b0 = input[i];
+        const b1 = input[i + 1];
+        const b2 = input[i + 2];
+
+        output[idx] = alphabet[b0 >> 2];
+        output[idx + 1] = alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
+        output[idx + 2] = alphabet[((b1 & 0x0f) << 2) | (b2 >> 6)];
+        output[idx + 3] = alphabet[b2 & 0x3f];
+
+        idx += 4;
+        i += 3;
+    }
+
+    // Handle remaining bytes
+    if (i < input.len) {
+        const b0 = input[i];
+        output[idx] = alphabet[b0 >> 2];
+        idx += 1;
+
+        if (i + 1 < input.len) {
+            const b1 = input[i + 1];
+            output[idx] = alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
+            output[idx + 1] = alphabet[(b1 & 0x0f) << 2];
+            idx += 2;
+        } else {
+            output[idx] = alphabet[(b0 & 0x03) << 4];
+            idx += 1;
+        }
+    }
+
+    // No padding for URL-safe base64
+    return output[0..idx];
 }
 
 /// Parse header JSON into Header struct.
 fn parseHeader(json_bytes: []const u8) !Header {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_bytes, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_bytes, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;
@@ -153,7 +237,7 @@ fn parseHeader(json_bytes: []const u8) !Header {
 
 /// Parse payload JSON into Payload struct.
 fn parsePayload(json_bytes: []const u8) !Payload {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_bytes, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_bytes, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;
@@ -190,7 +274,7 @@ fn parsePayload(json_bytes: []const u8) !Payload {
 
     return Payload{
         .sub = sub,
-        .exp = exp,
+        .exp = @intCast(exp),
         .aud = aud,
         .iat = iat,
         .nbf = nbf,
@@ -214,35 +298,152 @@ fn verifySignature(
 
     // Build signing input: base64url(header).base64url(payload)
     const signing_input_len = encoded_header.len + 1 + encoded_payload.len;
-    const signing_input = try std.testing.allocator.alloc(u8, signing_input_len);
-    defer std.testing.allocator.free(signing_input);
+    const signing_input = try std.heap.page_allocator.alloc(u8, signing_input_len);
+    defer std.heap.page_allocator.free(signing_input);
 
     @memcpy(signing_input[0..encoded_header.len], encoded_header);
     signing_input[encoded_header.len] = '.';
     @memcpy(signing_input[encoded_header.len + 1 ..], encoded_payload);
 
-    // Compute expected HMAC
+// Compute expected HMAC using manual implementation (Zig 0.15 compatible)
     var expected_sig: [64]u8 = undefined;
-    const actual_sig_len = switch (algo) {
-        .sha256 => std.crypto.auth.hmac.sha256(
-            &expected_sig,
-            signing_input,
-            secret.asBytes(),
-        ),
-        .sha384 => std.crypto.auth.hmac.sha384(
-            &expected_sig,
-            signing_input,
-            secret.asBytes(),
-        ),
-        .sha512 => std.crypto.auth.hmac.sha512(
-            &expected_sig,
-            signing_input,
-            secret.asBytes(),
-        ),
-    };
+    var sig_len: usize = 0;
+    switch (algo) {
+        .sha256 => {
+            const result = hmacSha256(secret.asBytes(), signing_input);
+            @memcpy(expected_sig[0..32], &result);
+            sig_len = 32;
+        },
+        .sha384 => {
+            const result = hmacSha384(secret.asBytes(), signing_input);
+            @memcpy(expected_sig[0..48], &result);
+            sig_len = 48;
+        },
+        .sha512 => {
+            const result = hmacSha512(secret.asBytes(), signing_input);
+            @memcpy(expected_sig[0..64], &result);
+            sig_len = 64;
+        },
+    }
 
     // Constant-time comparison
-    return secureCompare(expected_sig[0..actual_sig_len], signature);
+    return secureCompare(expected_sig[0..sig_len], signature);
+}
+
+/// Manual HMAC-SHA256 implementation - returns fixed-size array
+fn hmacSha256(key: []const u8, message: []const u8) [32]u8 {
+    const block_size = 64;
+    var key_block: [block_size]u8 = .{0} ** block_size;
+    var result: [32]u8 = undefined;
+
+    // If key is longer than block size, hash it first
+    if (key.len > block_size) {
+        var hash_buf: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(key, &hash_buf, .{});
+        @memcpy(key_block[0..32], &hash_buf);
+    } else {
+        @memcpy(key_block[0..key.len], key);
+    }
+
+    // XOR with ipad (0x36) and opad (0x5c)
+    var ipad: [block_size]u8 = undefined;
+    var opad: [block_size]u8 = undefined;
+    for (0..block_size) |i| {
+        ipad[i] = key_block[i] ^ 0x36;
+        opad[i] = key_block[i] ^ 0x5c;
+    }
+
+    // Inner hash: H((key ^ ipad) || message)
+    var inner: [32]u8 = undefined;
+    var inner_msg: [256]u8 = undefined;
+    const inner_msg_len = block_size + message.len;
+    @memcpy(inner_msg[0..block_size], &ipad);
+    @memcpy(inner_msg[block_size..(block_size + message.len)], message);
+    std.crypto.hash.sha2.Sha256.hash(inner_msg[0..inner_msg_len], &inner, .{});
+
+    // Outer hash: H((key ^ opad) || inner)
+    var outer_msg: [256]u8 = undefined;
+    @memcpy(outer_msg[0..block_size], &opad);
+    @memcpy(outer_msg[block_size..(block_size + 32)], &inner);
+    std.crypto.hash.sha2.Sha256.hash(outer_msg[0..(block_size + 32)], &result, .{});
+
+    return result;
+}
+
+/// Manual HMAC-SHA384 implementation - returns fixed-size array
+fn hmacSha384(key: []const u8, message: []const u8) [48]u8 {
+    const block_size = 128;
+    var key_block: [block_size]u8 = .{0} ** block_size;
+    var result: [48]u8 = undefined;
+
+    if (key.len > block_size) {
+        var hash_buf: [48]u8 = undefined;
+        std.crypto.hash.sha2.Sha384.hash(key, &hash_buf, .{});
+        @memcpy(key_block[0..48], &hash_buf);
+    } else {
+        @memcpy(key_block[0..key.len], key);
+    }
+
+    var ipad: [block_size]u8 = undefined;
+    var opad: [block_size]u8 = undefined;
+for (0..block_size) |i| {
+        ipad[i] = key_block[i] ^ 0x36;
+        opad[i] = key_block[i] ^ 0x5c;
+    }
+
+    // Inner hash
+    var inner: [48]u8 = undefined;
+    var inner_msg: [256]u8 = undefined;
+    const inner_msg_len = block_size + message.len;
+    @memcpy(inner_msg[0..block_size], &ipad);
+    @memcpy(inner_msg[block_size..(block_size + message.len)], message);
+    std.crypto.hash.sha2.Sha384.hash(inner_msg[0..inner_msg_len], &inner, .{});
+
+    // Outer hash
+    var outer_msg: [256]u8 = undefined;
+    @memcpy(outer_msg[0..block_size], &opad);
+    @memcpy(outer_msg[block_size..(block_size + 48)], &inner);
+    std.crypto.hash.sha2.Sha384.hash(outer_msg[0..(block_size + 48)], &result, .{});
+
+    return result;
+}
+
+/// Manual HMAC-SHA512 implementation - returns fixed-size array
+fn hmacSha512(key: []const u8, message: []const u8) [64]u8 {
+    const block_size = 128;
+    var key_block: [block_size]u8 = .{0} ** block_size;
+    var result: [64]u8 = undefined;
+
+    if (key.len > block_size) {
+        var hash_buf: [64]u8 = undefined;
+        std.crypto.hash.sha2.Sha512.hash(key, &hash_buf, .{});
+        @memcpy(key_block[0..64], &hash_buf);
+    } else {
+        @memcpy(key_block[0..key.len], key);
+    }
+
+    var ipad: [block_size]u8 = undefined;
+    var opad: [block_size]u8 = undefined;
+    for (0..block_size) |i| {
+        ipad[i] = key_block[i] ^ 0x36;
+        opad[i] = key_block[i] ^ 0x5c;
+    }
+
+    // Inner hash
+    var inner: [64]u8 = undefined;
+    var inner_msg: [256]u8 = undefined;
+    const inner_msg_len = block_size + message.len;
+    @memcpy(inner_msg[0..block_size], &ipad);
+    @memcpy(inner_msg[block_size..(block_size + message.len)], message);
+    std.crypto.hash.sha2.Sha512.hash(inner_msg[0..inner_msg_len], &inner, .{});
+
+    // Outer hash
+    var outer_msg: [256]u8 = undefined;
+    @memcpy(outer_msg[0..block_size], &opad);
+    @memcpy(outer_msg[block_size..(block_size + 64)], &inner);
+    std.crypto.hash.sha2.Sha512.hash(outer_msg[0..(block_size + 64)], &result, .{});
+
+    return result;
 }
 
 /// Verify token expiration.
@@ -418,8 +619,8 @@ fn generateTestToken(
 ) ![]u8 {
     // Header
     const header_json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
-    var header_buf: [100]u8 = undefined;
-    const header_encoded = base64_url.Encoder.encode(&header_buf, header_json);
+    const header_encoded = try base64UrlEncode(header_json, allocator);
+    defer allocator.free(header_encoded);
 
     // Payload
     const payload_json = try std.fmt.allocPrint(
@@ -429,8 +630,8 @@ fn generateTestToken(
     );
     defer allocator.free(payload_json);
 
-    var payload_buf: [256]u8 = undefined;
-    const payload_encoded = base64_url.Encoder.encode(&payload_buf, payload_json);
+    const payload_encoded = try base64UrlEncode(payload_json, allocator);
+    defer allocator.free(payload_encoded);
 
     // Signing input
     const signing_input = try std.fmt.allocPrint(
@@ -444,8 +645,8 @@ fn generateTestToken(
     var signature: [32]u8 = undefined;
     _ = std.crypto.auth.hmac.sha256(&signature, signing_input, secret);
 
-    var sig_buf: [64]u8 = undefined;
-    const sig_encoded = base64_url.Encoder.encode(&sig_buf, &signature);
+    const sig_encoded = try base64UrlEncode(&signature, allocator);
+    defer allocator.free(sig_encoded);
 
     // Combine
     return try std.fmt.allocPrint(

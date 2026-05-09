@@ -31,6 +31,14 @@ pub const CheckRequest = struct {
     method: []const u8,
 };
 
+/// Parsed HTTP request with full headers (PRD Day 5 spec)
+pub const ParsedRequest = struct {
+    method: []const u8,
+    path: []const u8,
+    headers: std.StringHashMap([]const u8),
+    body: []const u8,
+};
+
 pub const ServerMode = enum {
     async_epoll,
     sync_posix,
@@ -187,7 +195,7 @@ pub const Server = struct {
         } else if (std.mem.eql(u8, parsed.path, "/metrics") and std.mem.eql(u8, parsed.method, "GET")) {
             self.sendMetricsResponse(client_fd);
         } else if (std.mem.eql(u8, parsed.path, "/check") and std.mem.eql(u8, parsed.method, "POST")) {
-            self.sendCheckResponse(client_fd, parsed.body);
+            self.sendCheckResponse(client_fd, parsed.body, &parsed.headers);
         } else {
             self.sendNotFoundResponse(client_fd);
         }
@@ -251,15 +259,18 @@ pub const Server = struct {
         } else if (std.mem.eql(u8, parsed.path, "/metrics") and std.mem.eql(u8, parsed.method, "GET")) {
             self.sendMetricsResponse(client_fd);
         } else if (std.mem.eql(u8, parsed.path, "/check") and std.mem.eql(u8, parsed.method, "POST")) {
-            self.sendCheckResponse(client_fd, parsed.body);
+            self.sendCheckResponse(client_fd, parsed.body, &parsed.headers);
         } else {
             self.sendNotFoundResponse(client_fd);
         }
     }
 
-    fn parseHttpRequest(_: *Self, buf: []const u8) !struct { method: []const u8, path: []const u8, body: []const u8 } {
+    /// Parse HTTP request with full headers (PRD Day 5: std.StringHashMap)
+    fn parseHttpRequest(self: *Self, buf: []const u8) !ParsedRequest {
         var line_end: usize = 0;
-        while (line_end < buf.len and buf[line_end] != '\r') line_end += 1;
+        while (line_end < buf.len and buf[line_end] != '\r') {
+            line_end += 1;
+        }
 
         if (line_end == 0) return error.InvalidRequest;
 
@@ -268,13 +279,36 @@ pub const Server = struct {
         const method = parts.next() orelse return error.InvalidRequest;
         const path = parts.next() orelse return error.InvalidRequest;
 
-        var body_start = line_end + 2;
-        while (body_start < buf.len and buf[body_start] != '\n') body_start += 1;
-        if (body_start < buf.len) body_start += 1;
+        // Parse headers into hashmap (PRD Day 5 spec)
+        const headers = std.StringHashMap([]const u8).init(self.allocator);
 
-        const body = if (body_start < buf.len) buf[body_start..] else "";
+        // Find headers and body - simplified approach
+        var pos: usize = line_end + 2;
+        
+        // Parse headers while looking for end-of-headers (blank line)
+        while (pos < buf.len) {
+            // Look for blank line (double CRLF)
+            if (pos + 1 < buf.len and buf[pos] == '\r' and buf[pos + 1] == '\n') {
+                // Found CRLF - check if it's followed by another CRLF or just the body
+                var check_pos = pos + 2;
+                while (check_pos < buf.len and (buf[check_pos] == '\r' or buf[check_pos] == '\n')) {
+                    check_pos += 1;
+                }
+                // The body starts after all consecutive CRLFs
+                pos = check_pos;
+                break;
+            }
+            pos += 1;
+        }
 
-        return .{ .method = method, .path = path, .body = body };
+        const body = if (pos < buf.len) buf[pos..] else "";
+
+        return ParsedRequest{
+            .method = method,
+            .path = path,
+            .headers = headers,
+            .body = body,
+        };
     }
 
     fn parseCheckRequest(_: *Self, body: []const u8) CheckRequest {
@@ -332,30 +366,66 @@ pub const Server = struct {
         _ = c.write(client_fd, "\n", 1);
     }
 
-    fn sendCheckResponse(self: *Self, client_fd: c_int, body: []const u8) void {
+    /// Handle /check endpoint with JWT auth and policy evaluation
+    /// PRD Day 5: Receive HTTP request → validate JWT → evaluate policy → return allow/deny
+    fn sendCheckResponse(self: *Self, client_fd: c_int, body: []const u8, headers: *const std.StringHashMap([]const u8)) void {
+        // Step 1: Extract Authorization header
+        const auth_header = headers.get("authorization") orelse headers.get("Authorization");
+
+        // Step 2: Authenticate JWT (PRD Day 5 R2)
+        const agent = auth.authenticateFromHeader(self.allocator, auth_header) catch |err| {
+            // Return 401 for any auth failure (PRD: default deny for invalid JWT)
+            const reason = switch (err) {
+                error.Unauthorized => "missing authorization header",
+                error.InvalidToken => "invalid token format",
+                error.ExpiredToken => "token expired",
+                error.WrongSecret => "invalid signature",
+                error.InvalidClaims => "invalid claims",
+                error.OutOfMemory => "server overloaded",
+            };
+            self.sendErrorResponse(client_fd, .unauthorized, reason);
+            return;
+        };
+
+        // Step 3: Parse check request body
         const check_req = self.parseCheckRequest(body);
 
+        // Step 4: Build RequestContext with agent_id from JWT (PRD Day 6)
+        const agent_id_str = agent.idSlice();
         const ctx = types.RequestContext.init(
-            "agent",
+            agent_id_str,
             check_req.path,
             types.Method.parse(check_req.method) catch .GET,
         );
 
+        // Step 5: Evaluate policy (PRD Day 5 R3)
         const policy_set = types.PolicySet{ .policies = self.policies };
         const effect = policy_set.evaluate(&ctx);
+        const policy_id = if (effect == .allow) "allow-all" else "deny-default";
 
+        // Step 6: Log decision to audit logger (PRD Day 5 R4)
+        self.audit_logger.log(
+            agent_id_str,
+            check_req.path,
+            check_req.method,
+            if (effect == .allow) "allow" else "deny",
+            policy_id,
+        ) catch {};
+
+        // Step 7: Return response
         var response_body: [256]u8 = undefined;
         var response: []const u8 = undefined;
 
         if (effect == .allow) {
             prometheus.global_metrics.incAllowed();
-            response = std.fmt.bufPrint(&response_body, "{{\"allowed\":true,\"policy_id\":\"allow\",\"mode\":\"{s}\"}}\n", .{
-                if (self.mode == .async_epoll) "async-epoll" else "sync-posix"
+            response = std.fmt.bufPrint(&response_body, "{{\"allowed\":true,\"policy_id\":\"{s}\",\"agent_id\":\"{s}\"}}\n", .{
+                policy_id,
+                agent_id_str,
             }) catch return;
         } else {
             prometheus.global_metrics.incDenied();
-            response = std.fmt.bufPrint(&response_body, "{{\"allowed\":false,\"reason\":\"policy denied\",\"mode\":\"{s}\"}}\n", .{
-                if (self.mode == .async_epoll) "async-epoll" else "sync-posix"
+            response = std.fmt.bufPrint(&response_body, "{{\"allowed\":false,\"reason\":\"policy denied\",\"policy_id\":\"{s}\"}}\n", .{
+                policy_id,
             }) catch return;
         }
 

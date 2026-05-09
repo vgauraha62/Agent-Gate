@@ -4,10 +4,13 @@
 //! Extracts and validates JWT tokens from Authorization headers.
 
 const std = @import("std");
-const jwt = @import("../auth/jwt.zig").JWT;
+const jwt_mod = @import("../auth/jwt.zig");
+const JWT = jwt_mod.JWT;
+const JwtError = jwt_mod.JwtError;
 const SecurityArena = @import("../memory.zig").SecurityArena;
 const Secret = @import("../secret.zig").Secret;
 const Agent = @import("../agent.zig").Agent;
+const PermissionSet = @import("../agent.zig").PermissionSet;
 
 /// Authentication error types
 pub const AuthError = error{
@@ -16,6 +19,7 @@ pub const AuthError = error{
     ExpiredToken,    // JWT exp claim expired
     WrongSecret,     // JWT signature doesn't match secret
     InvalidClaims,   // JWT claims validation failed
+    OutOfMemory,     // Memory allocation failed
 };
 
 /// Extract and validate JWT from Authorization header
@@ -46,13 +50,8 @@ pub fn authenticateFromHeader(
     var arena = try SecurityArena.init(allocator, 4096);
     defer arena.deinit();
 
-    // Parse the JWT
-    const parsed_jwt = jwt.parse(token, &arena) catch |err| {
-        switch (err) {
-            jwt.JwtError.MalformedToken, jwt.JwtError.InvalidBase64, _ => return error.InvalidToken,
-            else => return error.InvalidToken,
-        }
-    };
+    // Parse the JWT (any parse error -> InvalidToken)
+    const parsed_jwt = JWT.parse(token, &arena) catch return error.InvalidToken;
 
     // Get secret key for verification
     // In production, this would come from secure storage
@@ -60,14 +59,8 @@ pub fn authenticateFromHeader(
     var secret = try Secret.init(allocator, secret_key);
     defer secret.deinit();
 
-    // 4. Verify JWT
-    const valid = jwt.verify(&parsed_jwt, &secret) catch |err| {
-        switch (err) {
-            jwt.JwtError.TokenExpired => return error.ExpiredToken,
-            jwt.JwtError.InvalidSignature => return error.WrongSecret,
-            else => return error.InvalidClaims,
-        }
-    };
+    // 4. Verify JWT (any error -> invalid claims)
+    const valid = JWT.verify(&parsed_jwt, &secret) catch return error.InvalidClaims;
 
     if (!valid) {
         return error.WrongSecret;
@@ -76,10 +69,10 @@ pub fn authenticateFromHeader(
     // 5. Extract agent identity from verified claims
     // Create SHA256 hash of sub as agent ID (fixed 32 bytes)
     var id_buf: [32]u8 = undefined;
-    std.crypto.hash.sha256.digest(token, &id_buf);
+    std.crypto.hash.sha2.Sha256.hash(token, &id_buf, .{});
 
     // Create agent context with permissions
-    var permissions = Agent.PermissionSet{};
+    var permissions = PermissionSet{};
     permissions.all(); // Grant all permissions for now
 
     return Agent{
