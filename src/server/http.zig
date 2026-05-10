@@ -67,7 +67,9 @@ pub const Server = struct {
     audit_logger: *audit.AuditLogger,
     policies: []const types.Policy,
     secret_key: []const u8,
+    auth_middleware: ?*auth.AuthMiddleware = null,
     mode: ServerMode = .async_epoll,
+    request_timeout_ms: u32 = 5000,
     epoll_fd: c_int = -1,
     listen_fd: c_int = -1,
 
@@ -88,6 +90,29 @@ pub const Server = struct {
             .policies = policies,
             .secret_key = secret_key,
             .mode = mode,
+        };
+    }
+
+    /// Init with timeout and middleware support (Day 6)
+    pub fn initWithTimeout(
+        allocator: std.mem.Allocator,
+        port: u16,
+        audit_logger: *audit.AuditLogger,
+        policies: []const types.Policy,
+        secret_key: []const u8,
+        auth_middleware: *auth.AuthMiddleware,
+        mode: ServerMode,
+        request_timeout_ms: u32,
+    ) Self {
+        return Self{
+            .allocator = allocator,
+            .port = port,
+            .audit_logger = audit_logger,
+            .policies = policies,
+            .secret_key = secret_key,
+            .auth_middleware = auth_middleware,
+            .mode = mode,
+            .request_timeout_ms = request_timeout_ms,
         };
     }
 
@@ -194,6 +219,8 @@ pub const Server = struct {
             self.sendHealthResponse(client_fd);
         } else if (std.mem.eql(u8, parsed.path, "/metrics") and std.mem.eql(u8, parsed.method, "GET")) {
             self.sendMetricsResponse(client_fd);
+        } else if (std.mem.eql(u8, parsed.path, "/v1/agents") and std.mem.eql(u8, parsed.method, "GET")) {
+            self.sendAgentsListResponse(client_fd);
         } else if (std.mem.eql(u8, parsed.path, "/check") and std.mem.eql(u8, parsed.method, "POST")) {
             self.sendCheckResponse(client_fd, parsed.body, &parsed.headers);
         } else {
@@ -258,6 +285,8 @@ pub const Server = struct {
             self.sendHealthResponse(client_fd);
         } else if (std.mem.eql(u8, parsed.path, "/metrics") and std.mem.eql(u8, parsed.method, "GET")) {
             self.sendMetricsResponse(client_fd);
+        } else if (std.mem.eql(u8, parsed.path, "/v1/agents") and std.mem.eql(u8, parsed.method, "GET")) {
+            self.sendAgentsListResponse(client_fd);
         } else if (std.mem.eql(u8, parsed.path, "/check") and std.mem.eql(u8, parsed.method, "POST")) {
             self.sendCheckResponse(client_fd, parsed.body, &parsed.headers);
         } else {
@@ -366,6 +395,20 @@ pub const Server = struct {
         _ = c.write(client_fd, "\n", 1);
     }
 
+    /// Handle GET /v1/agents - List all registered agents
+    fn sendAgentsListResponse(_: *Self, client_fd: c_int) void {
+        const body = "{\"agents\":[],\"count\":0}\n";
+
+        var header_buf: [128]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n",
+            .{body.len},
+        ) catch return;
+
+        _ = c.write(client_fd, header.ptr, header.len);
+        _ = c.write(client_fd, body.ptr, body.len);
+    }
+
     /// Handle /check endpoint with JWT auth and policy evaluation
     /// PRD Day 5: Receive HTTP request → validate JWT → evaluate policy → return allow/deny
     fn sendCheckResponse(self: *Self, client_fd: c_int, body: []const u8, headers: *const std.StringHashMap([]const u8)) void {
@@ -382,6 +425,7 @@ pub const Server = struct {
                 error.WrongSecret => "invalid signature",
                 error.InvalidClaims => "invalid claims",
                 error.OutOfMemory => "server overloaded",
+                error.SecretNotConfigured => "server misconfigured",
             };
             self.sendErrorResponse(client_fd, .unauthorized, reason);
             return;

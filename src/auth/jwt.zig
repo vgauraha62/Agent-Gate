@@ -169,7 +169,13 @@ fn base64UrlDecode(input: []const u8, arena: *SecurityArena) ![]u8 {
 
 /// Encode bytes to base64url string (Zig 0.15+ compatible)
 fn base64UrlEncode(input: []const u8, allocator: std.mem.Allocator) ![]const u8 {
-    const output_len = ((input.len + 2) / 3) * 4;
+    // base64url encoding WITHOUT padding (URL-safe alphabet)
+    // For n bytes: full_groups * 4 + (rem == 0 ? 0 : rem == 1 ? 2 : 3)
+    const full_groups = input.len / 3;
+    const rem = input.len % 3;
+    const extra: usize = if (rem == 0) 0 else if (rem == 1) 2 else 3;
+    const output_len = full_groups * 4 + extra;
+    
     const output = try allocator.alloc(u8, output_len);
 
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -191,7 +197,7 @@ fn base64UrlEncode(input: []const u8, allocator: std.mem.Allocator) ![]const u8 
         i += 3;
     }
 
-    // Handle remaining bytes
+    // Handle remaining bytes (1 or 2 bytes left)
     if (i < input.len) {
         const b0 = input[i];
         output[idx] = alphabet[b0 >> 2];
@@ -208,26 +214,34 @@ fn base64UrlEncode(input: []const u8, allocator: std.mem.Allocator) ![]const u8 
         }
     }
 
-    // No padding for URL-safe base64
+    // idx should equal output_len at this point - return the full slice
     return output[0..idx];
 }
 
 /// Parse header JSON into Header struct.
+/// NOTE: This function uses page_allocator for JSON parsing.
+/// The returned Header strings point to memory that will be freed when
+/// parsed.deinit() is called. For safety, copy the strings if needed after this call.
 fn parseHeader(json_bytes: []const u8) !Header {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_bytes, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;
 
-    const alg = if (obj.get("alg")) |v|
+    // Get string slices from JSON object (these point to memory owned by 'parsed')
+    const alg_slice = if (obj.get("alg")) |v|
         if (v == .string) v.string else return error.InvalidHeader
     else
         return error.InvalidHeader;
 
-    const typ = if (obj.get("typ")) |v|
+    const typ_slice = if (obj.get("typ")) |v|
         if (v == .string) v.string else return error.InvalidHeader
     else
         return error.InvalidHeader;
+
+    // Allocate owned copies of the strings
+    const alg = try std.heap.page_allocator.dupe(u8, alg_slice);
+    const typ = try std.heap.page_allocator.dupe(u8, typ_slice);
 
     return Header{
         .alg = alg,
@@ -236,17 +250,21 @@ fn parseHeader(json_bytes: []const u8) !Header {
 }
 
 /// Parse payload JSON into Payload struct.
+/// NOTE: This function uses page_allocator for JSON parsing.
+/// The returned Payload strings point to memory that will be freed when
+/// parsed.deinit() is called. For safety, copy the strings if needed after this call.
 fn parsePayload(json_bytes: []const u8) !Payload {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_bytes, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;
 
-    // Required: sub
-    const sub = if (obj.get("sub")) |v|
+    // Required: sub - copy the string slice to prevent use-after-free
+    const sub_raw = if (obj.get("sub")) |v|
         if (v == .string) v.string else return error.InvalidPayload
     else
         return error.InvalidPayload;
+    const sub = try std.heap.page_allocator.dupe(u8, sub_raw);
 
     // Required: exp
     const exp = if (obj.get("exp")) |v|
@@ -254,10 +272,12 @@ fn parsePayload(json_bytes: []const u8) !Payload {
     else
         return error.InvalidPayload;
 
-    // Optional: aud
+    // Optional: aud - copy if present
     var aud: ?[]const u8 = null;
     if (obj.get("aud")) |v| {
-        if (v == .string) aud = v.string;
+        if (v == .string) {
+            aud = try std.heap.page_allocator.dupe(u8, v.string);
+        }
     }
 
     // Optional: iat
@@ -620,7 +640,6 @@ fn generateTestToken(
     // Header
     const header_json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
     const header_encoded = try base64UrlEncode(header_json, allocator);
-    defer allocator.free(header_encoded);
 
     // Payload
     const payload_json = try std.fmt.allocPrint(
@@ -631,7 +650,6 @@ fn generateTestToken(
     defer allocator.free(payload_json);
 
     const payload_encoded = try base64UrlEncode(payload_json, allocator);
-    defer allocator.free(payload_encoded);
 
     // Signing input
     const signing_input = try std.fmt.allocPrint(
@@ -641,19 +659,32 @@ fn generateTestToken(
     );
     defer allocator.free(signing_input);
 
-    // Compute HMAC-SHA256
-    var signature: [32]u8 = undefined;
-    _ = std.crypto.auth.hmac.sha256(&signature, signing_input, secret);
+    // Compute HMAC-SHA256 using the manual implementation
+    const signature = hmacSha256(secret, signing_input);
 
     const sig_encoded = try base64UrlEncode(&signature, allocator);
-    defer allocator.free(sig_encoded);
 
-    // Combine
-    return try std.fmt.allocPrint(
-        allocator,
-        "{s}.{s}.{s}",
-        .{ header_encoded, payload_encoded, sig_encoded },
-    );
+    // Calculate total output length
+    const total_len = header_encoded.len + 1 + payload_encoded.len + 1 + sig_encoded.len;
+    
+    // Allocate exactly the space we need for the final result
+    const result = try allocator.alloc(u8, total_len);
+    
+    // Build the result
+    @memcpy(result[0..header_encoded.len], header_encoded);
+    var pos = header_encoded.len;
+    result[pos] = '.'; pos += 1;
+    @memcpy(result[pos..(pos + payload_encoded.len)], payload_encoded);
+    pos += payload_encoded.len;
+    result[pos] = '.'; pos += 1;
+    @memcpy(result[pos..(pos + sig_encoded.len)], sig_encoded);
+
+    // Free intermediate allocations (they were allocated separately)
+    allocator.free(header_encoded);
+    allocator.free(payload_encoded);
+    allocator.free(sig_encoded);
+
+    return result;
 }
 
 test "JWT full parse and verify - valid token" {
@@ -715,11 +746,12 @@ test "JWT verify - wrong secret" {
     const token = try generateTestToken(gpa, secret_key, "agent-123", 9999999999);
     defer gpa.free(token);
 
-    // Verify with wrong secret should fail
+    // Verify with wrong secret should return false (not an error)
     var jwt = try JWT.parse(token, &arena);
-    const result = jwt.verify(&wrong_secret);
+    const valid = try jwt.verify(&wrong_secret);
 
-    try std.testing.expectError(error.InvalidSignature, result);
+    // Signature mismatch returns false, not an error
+    try std.testing.expect(!valid);
 }
 
 test "JWT parse - malformed token (missing parts)" {
@@ -861,4 +893,93 @@ test "JWT arena reset invalidates token" {
     // After reset, token data is zeroed - verify may fail or succeed depending on timing
     // This demonstrates the security property: arena reset invalidates data
     _ = jwt.verify(&secret) catch {};
+}
+
+// ============================================================================
+// Public Test Helpers (Day 6)
+// ============================================================================
+
+/// Generate a valid JWT token for testing purposes.
+/// Caller owns returned memory - must free with allocator.
+pub fn generateTestJWT(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    subject: []const u8,
+    expires_in_seconds: u64,
+) ![]u8 {
+    const now = @as(u64, @intCast(std.time.timestamp()));
+    const exp = now + expires_in_seconds;
+    return try generateTestToken(allocator, secret, subject, exp);
+}
+
+/// Generate an expired JWT token for testing.
+/// Useful for testing token expiration handling.
+pub fn generateExpiredJWT(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    subject: []const u8,
+) ![]u8 {
+    // Set expiration to 1 hour ago
+    const now = @as(u64, @intCast(std.time.timestamp()));
+    const exp = now - 3600; // 1 hour in the past
+    return try generateTestToken(allocator, secret, subject, exp);
+}
+
+test "generateTestJWT creates valid tokens" {
+    const gpa = std.testing.allocator;
+    var arena = try SecurityArena.init(gpa, 2048);
+    defer arena.deinit();
+
+    const secret = "test-secret-key-for-jwt-generation";
+    var sec = try Secret.init(gpa, secret);
+    defer sec.deinit();
+
+    // Generate token valid for 1 hour
+    const token = try generateTestJWT(gpa, secret, "agent-test", 3600);
+    defer gpa.free(token);
+
+    // Verify token parses correctly
+    var jwt = try JWT.parse(token, &arena);
+    try std.testing.expectEqualStrings("agent-test", jwt.payload.sub);
+
+    // Verify it can be verified successfully
+    const valid = try jwt.verify(&sec);
+    try std.testing.expect(valid);
+}
+
+test "generateExpiredJWT creates expired tokens" {
+    const gpa = std.testing.allocator;
+    var arena = try SecurityArena.init(gpa, 1024);
+    defer arena.deinit();
+
+    const secret = "test-secret";
+    var sec = try Secret.init(gpa, secret);
+    defer sec.deinit();
+
+    const token = try generateExpiredJWT(gpa, secret, "agent-test");
+    defer gpa.free(token);
+
+    var jwt = try JWT.parse(token, &arena);
+    const result = jwt.verify(&sec);
+    try std.testing.expectError(JwtError.TokenExpired, result);
+}
+
+test "generateTestJWT with different expiration times" {
+    const gpa = std.testing.allocator;
+    var arena = try SecurityArena.init(gpa, 2048);
+    defer arena.deinit();
+
+    const secret = "test-secret-key-for-testing";
+    var sec = try Secret.init(gpa, secret);
+    defer sec.deinit();
+
+    // Token valid for 1 hour
+    const token = try generateTestJWT(gpa, secret, "agent", 3600);
+    defer gpa.free(token);
+
+    var jwt = try JWT.parse(token, &arena);
+    try std.testing.expect(try jwt.verify(&sec));
+
+    // Note: Actual expiration timing test skipped as std.time.sleep unavailable
+    // The expired token test above covers expiration behavior
 }

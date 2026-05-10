@@ -1,25 +1,35 @@
 const std = @import("std");
-const Config = @import("config.zig").Config;
+const Config = @import("config.zig");
 const http = @import("server/http.zig");
 const audit = @import("audit/logger.zig");
 const types = @import("policy/types.zig");
+const auth_middleware = @import("server/auth_middleware.zig");
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    std.debug.print("Agent-Gate HTTP Server v1.0.0\n", .{});
+    std.debug.print("AgentGate v1.0.0\n", .{});
 
-    const config = Config.init();
-    std.debug.print("Config: sensor_count={}, event_interval_ms={}, max_log_entries={}\n", .{
-        config.sensor_count,
-        config.event_interval_ms,
-        config.max_log_entries,
-    });
+    // Load configuration
+    var config = Config.Config.default();
+    defer config.deinit();
 
-    const port: u16 = 8080;
-    const secret_key = "super-secret-key-for-testing";
+    // Override with environment or defaults
+    if (std.process.getEnvVarOwned(allocator, "JWT_SECRET")) |jwt_secret| {
+        defer allocator.free(jwt_secret);
+        config.auth.jwt_secret = jwt_secret;
+    } else |_| {
+        // Use default for testing
+        config.auth.jwt_secret = "agent-gate-default-secret-32bytes!";
+    }
+
+    // Validate configuration
+    config.validate() catch |err| {
+        std.debug.print("[Startup] Config validation failed: {}\n", .{err});
+        return err;
+    };
 
     var mode = http.ServerMode.async_epoll;
 
@@ -39,10 +49,20 @@ pub fn main() !void {
     std.debug.print("[Startup] Mode: {s}\n", .{
         if (mode == .async_epoll) "async (epoll)" else "sync (POSIX sockets)",
     });
+    std.debug.print("[Startup] Auth timeout: {d}ms, Policy timeout: {d}ms\n", .{
+        config.auth.auth_timeout_ms,
+        config.policy.policy_timeout_ms,
+    });
 
+    // Initialize audit logger
     var audit_logger = audit.AuditLogger.init(allocator);
     defer audit_logger.deinit();
 
+    // Initialize auth middleware with configured secret
+    var middleware = try auth_middleware.AuthMiddleware.init(allocator, config.auth.jwt_secret);
+    defer middleware.deinit();
+
+    // Define default policies
     const default_policies = [_]types.Policy{
         types.Policy{
             .id = "allow-all",
@@ -51,17 +71,20 @@ pub fn main() !void {
         },
     };
 
-    var server = http.Server.init(
+    // Create server with auth middleware and config-driven timeouts
+    var server = http.Server.initWithTimeout(
         allocator,
-        port,
+        config.server.port,
         &audit_logger,
         &default_policies,
-        secret_key,
+        config.auth.jwt_secret,
+        &middleware,
         mode,
+        config.request.request_timeout_ms,
     );
     defer server.deinit();
 
-    std.debug.print("[Startup] Starting HTTP server...\n", .{});
+    std.debug.print("[Startup] Starting HTTP server on port {d}...\n", .{config.server.port});
 
     server.run() catch |err| {
         std.debug.print("[Startup] Server error: {}\n", .{err});

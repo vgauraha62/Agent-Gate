@@ -46,7 +46,8 @@ test "ServerInit creates valid server" {
         .conditions = &[_]types.Condition{},
     }};
 
-    const server = http.Server.init(std.heap.page_allocator, 8080, &audit_logger, policies, "secret-key", .async_epoll);
+    // Note: Middleware is optional for basic Server init test
+    const server = http.Server.init(std.heap.page_allocator, 8080, &audit_logger, policies, "secret-key", null, .async_epoll);
 
     try std.testing.expectEqual(@as(u16, 8080), server.port);
 }

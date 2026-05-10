@@ -21,6 +21,51 @@ pub const Effect = enum(u1) {
     }
 };
 
+/// Decision - The result of policy evaluation with attribution.
+/// Day 6: Extended from Effect to include policy_id for audit logging.
+pub const Decision = struct {
+    /// The effect of the decision.
+    effect: Effect,
+    /// The ID of the policy that produced this decision.
+    policy_id: []const u8,
+    /// Timestamp of evaluation (Unix nanoseconds).
+    timestamp: i128,
+    /// Time taken for evaluation in nanoseconds.
+    evaluation_time_ns: u64,
+
+    const Self = @This();
+
+    /// Create an allow decision with a specific policy ID.
+    pub fn allow(policy_id: []const u8, eval_time_ns: u64) Self {
+        return Self{
+            .effect = .allow,
+            .policy_id = policy_id,
+            .timestamp = std.time.timestamp(),
+            .evaluation_time_ns = eval_time_ns,
+        };
+    }
+
+    /// Create a deny decision with a specific policy ID.
+    pub fn deny(policy_id: []const u8, eval_time_ns: u64) Self {
+        return Self{
+            .effect = .deny,
+            .policy_id = policy_id,
+            .timestamp = std.time.timestamp(),
+            .evaluation_time_ns = eval_time_ns,
+        };
+    }
+
+    /// Create a default deny decision (no matching policy).
+    pub fn defaultDeny() Self {
+        return Self{
+            .effect = .deny,
+            .policy_id = "default-deny",
+            .timestamp = std.time.timestamp(),
+            .evaluation_time_ns = 0,
+        };
+    }
+};
+
 /// HTTP Methods supported by policies.
 pub const Method = enum(u3) {
     GET = 0,
@@ -156,6 +201,32 @@ pub const PolicySet = struct {
             }
         }
         return .deny; // Default deny
+    }
+
+    /// Evaluate the request context and return a Decision with policy attribution.
+    /// Day 6: Extended version for audit logging.
+    pub fn evaluateWithDecision(self: *const Self, ctx: *const RequestContext) Decision {
+        const start_time = std.time.nanoTimestamp();
+
+        for (self.policies) |policy| {
+            if (policy.matchesAll(ctx)) {
+                const eval_time = @as(u64, @intCast(std.time.nanoTimestamp() - start_time));
+                // Return the policy's actual effect (allow or deny)
+                switch (policy.effect) {
+                    .allow => return Decision.allow(policy.id, eval_time),
+                    .deny => return Decision.deny(policy.id, eval_time),
+                }
+            }
+        }
+
+        // Default deny when no policy matches
+        const eval_time = @as(u64, @intCast(std.time.nanoTimestamp() - start_time));
+        return Decision{
+            .effect = .deny,
+            .policy_id = "default-deny",
+            .timestamp = std.time.timestamp(),
+            .evaluation_time_ns = eval_time,
+        };
     }
 };
 
@@ -675,4 +746,148 @@ test "agent_id condition does not check path or method" {
     const agent_cond = Condition{ .agent_id = "specific-agent" };
     try std.testing.expect(agent_cond.matches(&ctx1));
     try std.testing.expect(agent_cond.matches(&ctx2));
+}
+
+// ============================================================================
+// Decision struct tests (Day 6)
+// ============================================================================
+
+test "Decision: allow creates correct struct" {
+    const decision = Decision.allow("policy-001", 1500);
+
+    try std.testing.expectEqual(Effect.allow, decision.effect);
+    try std.testing.expectEqualStrings("policy-001", decision.policy_id);
+    try std.testing.expectEqual(@as(u64, 1500), decision.evaluation_time_ns);
+    try std.testing.expect(decision.timestamp > 0);
+}
+
+test "Decision: deny creates correct struct" {
+    const decision = Decision.deny("policy-002", 2000);
+
+    try std.testing.expectEqual(Effect.deny, decision.effect);
+    try std.testing.expectEqualStrings("policy-002", decision.policy_id);
+    try std.testing.expectEqual(@as(u64, 2000), decision.evaluation_time_ns);
+}
+
+test "Decision: defaultDeny has correct defaults" {
+    const decision = Decision.defaultDeny();
+
+    try std.testing.expectEqual(Effect.deny, decision.effect);
+    try std.testing.expectEqualStrings("default-deny", decision.policy_id);
+    try std.testing.expectEqual(@as(u64, 0), decision.evaluation_time_ns);
+}
+
+test "Decision: timestamp is set on creation" {
+    const before = std.time.timestamp();
+    const decision = Decision.allow("test", 0);
+    const after = std.time.timestamp();
+
+    try std.testing.expect(decision.timestamp >= before);
+    try std.testing.expect(decision.timestamp <= after);
+}
+
+test "PolicySet: evaluateWithDecision returns Decision with policy_id" {
+    const policies = &[_]Policy{
+        Policy{
+            .id = "allow-api",
+            .effect = .allow,
+            .conditions = &[_]Condition{Condition{ .path = "/api/*" }},
+        },
+    };
+
+    const set = PolicySet{ .policies = policies };
+    const ctx = RequestContext.init("agent", "/api/test", .GET);
+    const decision = set.evaluateWithDecision(&ctx);
+
+    try std.testing.expectEqual(Effect.allow, decision.effect);
+    try std.testing.expectEqualStrings("allow-api", decision.policy_id);
+    try std.testing.expect(decision.evaluation_time_ns >= 0);
+}
+
+test "PolicySet: evaluateWithDecision no match returns default-deny" {
+    const policies = &[_]Policy{
+        Policy{
+            .id = "allow-specific",
+            .effect = .allow,
+            .conditions = &[_]Condition{Condition{ .path = "/specific/*" }},
+        },
+    };
+
+    const set = PolicySet{ .policies = policies };
+    const ctx = RequestContext.init("agent", "/other", .GET);
+    const decision = set.evaluateWithDecision(&ctx);
+
+    try std.testing.expectEqual(Effect.deny, decision.effect);
+    try std.testing.expectEqualStrings("default-deny", decision.policy_id);
+}
+
+test "PolicySet: evaluateWithDecision first-match-wins with policy_id" {
+    const policies = &[_]Policy{
+        Policy{
+            .id = "deny-all",
+            .effect = .deny,
+            .conditions = &[_]Condition{Condition{ .path = "*" }},
+        },
+        Policy{
+            .id = "allow-api",
+            .effect = .allow,
+            .conditions = &[_]Condition{Condition{ .path = "/api/*" }},
+        },
+    };
+
+    const set = PolicySet{ .policies = policies };
+    const ctx = RequestContext.init("agent", "/api/test", .GET);
+    const decision = set.evaluateWithDecision(&ctx);
+
+    // First match (deny-all) wins
+    try std.testing.expectEqual(Effect.deny, decision.effect);
+    try std.testing.expectEqualStrings("deny-all", decision.policy_id);
+}
+
+test "PolicySet: evaluateWithDecision evaluation_time_ns is measured" {
+    const policies = &[_]Policy{
+        Policy{
+            .id = "allow-api",
+            .effect = .allow,
+            .conditions = &[_]Condition{Condition{ .path = "/api/*" }},
+        },
+    };
+
+    const set = PolicySet{ .policies = policies };
+    const ctx = RequestContext.init("agent", "/api/test", .GET);
+
+    // Run multiple times to ensure timing is captured
+    var total_time: u64 = 0;
+    for (0..10) |_| {
+        const decision = set.evaluateWithDecision(&ctx);
+        total_time += decision.evaluation_time_ns;
+    }
+
+    // Average should be non-zero
+    try std.testing.expect(total_time > 0);
+}
+
+test "PolicySet: evaluate vs evaluateWithDecision consistency" {
+    const policies = &[_]Policy{
+        Policy{
+            .id = "allow-api",
+            .effect = .allow,
+            .conditions = &[_]Condition{Condition{ .path = "/api/*" }},
+        },
+        Policy{
+            .id = "deny-admin",
+            .effect = .deny,
+            .conditions = &[_]Condition{Condition{ .path = "/admin/*" }},
+        },
+    };
+
+    const set = PolicySet{ .policies = policies };
+    const ctx_api = RequestContext.init("agent", "/api/test", .GET);
+    const ctx_admin = RequestContext.init("agent", "/admin/test", .GET);
+    const ctx_other = RequestContext.init("agent", "/other", .GET);
+
+    // Both methods should return same effect
+    try std.testing.expectEqual(set.evaluate(&ctx_api), set.evaluateWithDecision(&ctx_api).effect);
+    try std.testing.expectEqual(set.evaluate(&ctx_admin), set.evaluateWithDecision(&ctx_admin).effect);
+    try std.testing.expectEqual(set.evaluate(&ctx_other), set.evaluateWithDecision(&ctx_other).effect);
 }
