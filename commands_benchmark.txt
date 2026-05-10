@@ -1,0 +1,15 @@
+cd /home/gauraha/zig/agent-gate && pkill -f agent-gate 2>/dev/null || true; sleep 1
+# Start server in background
+JWT_SECRET="agent-gate-default-secret-32bytes!" ./zig-out/bin/agent-gate &
+SERVER_PID=$!
+echo "Server PID: $SERVER_PID"
+sleep 3
+# Quick connectivity test
+curl -s http://127.0.0.1:8080/v1/agents 2>&1
+echo "---"
+echo "Running benchmark..."
+# Run loadtest with minimal settings
+./zig-out/bin/loadtest --workers 2 --requests 10 --no-spawn 2>&1
+# Cleanup
+kill $SERVER_PID 2>/dev/null || true
+echo "Done"

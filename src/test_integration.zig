@@ -2,6 +2,7 @@ const std = @import("std");
 const http = @import("server/http.zig");
 const audit = @import("audit/logger.zig");
 const types = @import("policy/types.zig");
+const AuditLog = audit.AuditLog;
 
 test "HttpStatus enum values" {
     try std.testing.expectEqual(@as(u16, 200), @intFromEnum(http.HttpStatus.ok));
@@ -37,8 +38,7 @@ test "CheckRequest struct" {
 }
 
 test "ServerInit creates valid server" {
-    var audit_logger = audit.AuditLogger.init(std.heap.page_allocator);
-    defer audit_logger.deinit();
+    var audit_logger = AuditLog.init();
 
     const policies = &[_]types.Policy{types.Policy{
         .id = "test",
@@ -47,34 +47,32 @@ test "ServerInit creates valid server" {
     }};
 
     // Note: Middleware is optional for basic Server init test
-    const server = http.Server.init(std.heap.page_allocator, 8080, &audit_logger, policies, "secret-key", null, .async_epoll);
+    const server = http.Server.init(std.heap.page_allocator, 8080, &audit_logger, policies, "secret-key", .async_epoll);
 
     try std.testing.expectEqual(@as(u16, 8080), server.port);
 }
 
-test "AuditLogger log entry" {
-    var logger = audit.AuditLogger.init(std.heap.page_allocator);
-    defer logger.deinit();
+test "AuditLog log entry" {
+    var logger = AuditLog.init();
+    const agent_id = [_]u8{0xAA} ** 32;
 
-    try logger.log("agent-1", "/api/test", "GET", "allow", "test-policy");
+    logger.log(agent_id, "/api/test", .allow, 1);
 
-    try std.testing.expectEqual(@as(usize, 1), logger.entryCount());
+    try std.testing.expectEqual(@as(u48, 1), logger.entryCount());
 
     const entry = logger.getEntry(0);
     try std.testing.expect(entry != null);
 }
 
-test "AuditLogger ring buffer wrap" {
-    var logger = audit.AuditLogger.init(std.heap.page_allocator);
-    defer logger.deinit();
+test "AuditLog ring buffer wrap" {
+    var logger = AuditLog.init();
+    const agent_id = [_]u8{0xAA} ** 32;
 
-    for (0..audit.MAX_ENTRIES + 5) |i| {
-        const path = std.fmt.allocPrint(std.heap.page_allocator, "/api/test/{d}", .{i}) catch @panic("OOM");
-        defer std.heap.page_allocator.free(path);
-        try logger.log("agent-1", path, "GET", "allow", "test-policy");
+    for (0..audit.BUFFER_SIZE + 5) |_| {
+        logger.log(agent_id, "/api/test", .allow, 1);
     }
 
-    try std.testing.expectEqual(audit.MAX_ENTRIES, logger.entryCount());
+    try std.testing.expectEqual(@as(u48, audit.BUFFER_SIZE + 5), logger.entryCount());
 }
 
 test "Policy types - Method parse" {

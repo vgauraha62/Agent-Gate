@@ -9,6 +9,7 @@ const c = std.c;
 const auth = @import("auth_middleware.zig");
 const types = @import("../policy/types.zig");
 const audit = @import("../audit/logger.zig");
+const AuditLog = audit.AuditLog;
 const prometheus = @import("../metrics/prometheus.zig");
 
 const EPOLLIN: u32 = 0x001;
@@ -517,8 +518,7 @@ pub const Server = struct {
 
 test "Server init async" {
     const allocator = std.heap.page_allocator;
-    var logger = audit.AuditLogger.init(allocator);
-    defer logger.deinit();
+    var logger = AuditLog.init();
 
     const policies = &[_]types.Policy{};
     const server = Server.init(allocator, 8080, &logger, policies, "test-secret", .async_epoll);
@@ -529,8 +529,7 @@ test "Server init async" {
 
 test "Server init sync" {
     const allocator = std.heap.page_allocator;
-    var logger = audit.AuditLogger.init(allocator);
-    defer logger.deinit();
+    var logger = AuditLog.init();
 
     const policies = &[_]types.Policy{};
     const server = Server.init(allocator, 8080, &logger, policies, "test-secret", .sync_posix);
@@ -548,8 +547,7 @@ test "Server statusText" {
 
 test "Server parse HTTP request valid" {
     const allocator = std.heap.page_allocator;
-    var logger = audit.AuditLogger.init(allocator);
-    defer logger.deinit();
+    var logger = AuditLog.init();
 
     var server = Server.init(allocator, 8080, &logger, &[_]types.Policy{}, "secret", .async_epoll);
 
@@ -562,8 +560,7 @@ test "Server parse HTTP request valid" {
 
 test "Server parse HTTP request with body" {
     const allocator = std.heap.page_allocator;
-    var logger = audit.AuditLogger.init(allocator);
-    defer logger.deinit();
+    var logger = AuditLog.init();
 
     var server = Server.init(allocator, 8080, &logger, &[_]types.Policy{}, "secret", .sync_posix);
 
