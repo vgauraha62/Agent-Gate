@@ -2,10 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    var optimize = b.standardOptimizeOption(.{});
-    
-    // Default to ReleaseSafe for better performance with correct semantics
-    if (optimize == .Debug) optimize = .ReleaseSafe;
+    const optimize = b.standardOptimizeOption(.{});
 
     const main_module = b.addModule("main", .{
         .root_source_file = b.path("src/main.zig"),
@@ -27,11 +24,6 @@ pub fn build(b: *std.Build) void {
     server.addImport("auth_middleware", b.addModule("auth_middleware", .{ .root_source_file = b.path("src/server/auth_middleware.zig") }));
     server.addImport("audit", b.addModule("audit", .{ .root_source_file = b.path("src/audit/logger.zig") }));
     main_module.addImport("server", server);
-    
-    // Add async HTTP server module
-    const server_async = b.addModule("server_async", .{ .root_source_file = b.path("src/server/http_async.zig") });
-    server_async.addImport("audit", b.addModule("audit", .{ .root_source_file = b.path("src/audit/logger.zig") }));
-    main_module.addImport("server_async", server_async);
 
     const exe = b.addExecutable(.{
         .name = "agent-gate",

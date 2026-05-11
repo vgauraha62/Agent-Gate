@@ -1,4 +1,19 @@
 cd /home/gauraha/zig/agent-gate && pkill -f agent-gate 2>/dev/null || true; sleep 1
+
+# Start server
+$ pkill -9 agent-gate 2>/dev/null; sleep 1
+nohup ./zig-out/bin/agent-gate > /tmp/server.log 2>&1 &
+sleep 2
+curl -s http://127.0.0.1:8080/health
+
+
+# Requires server running first (manual for now):
+./zig-out/bin/agent-gate &
+sleep 2
+zig build benchmark
+
+
+
 # Start server in background
 JWT_SECRET="agent-gate-default-secret-32bytes!" ./zig-out/bin/agent-gate &
 SERVER_PID=$!

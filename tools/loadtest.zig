@@ -11,6 +11,53 @@
 //! - Benchmark entry point with P50/P99/P999 latency
 
 const std = @import("std");
+const c = std.c;
+const posix = std.posix;
+
+// ============================================================================
+// New Data Structures for Detailed Benchmark Output
+// ============================================================================
+
+/// Check if a port is listening
+fn isPortReady(host: []const u8, port: u16) bool {
+    _ = host;
+    const address = std.net.Address.parseIp("127.0.0.1", port) catch return false;
+    const socket = std.net.tcpConnectToAddress(address) catch return false;
+    defer socket.close();
+    return true;
+}
+
+/// Request/Response size tracking
+pub const SizeStats = struct {
+    total_request_bytes: u64 = 0,
+    total_response_bytes: u64 = 0,
+    count: u64 = 0,
+
+    pub fn add(self: *SizeStats, req_sz: usize, res_sz: usize) void {
+        self.total_request_bytes += req_sz;
+        self.total_response_bytes += res_sz;
+        self.count += 1;
+    }
+
+    pub fn avgRequestSize(self: *const SizeStats) u64 {
+        return if (self.count > 0) self.total_request_bytes / self.count else 0;
+    }
+
+    pub fn avgResponseSize(self: *const SizeStats) u64 {
+        return if (self.count > 0) self.total_response_bytes / self.count else 0;
+    }
+};
+
+/// Per-second throughput tracking
+pub const ThroughputSecond = struct {
+    second: u64 = 0,
+    requests: u64 = 0,
+    total_latency: u64 = 0,
+
+    pub fn avgLatency(self: *const ThroughputSecond) u64 {
+        return if (self.requests > 0) self.total_latency / self.requests else 0;
+    }
+};
 
 /// Get current Unix timestamp in seconds.
 fn currentTimestamp() i64 {
@@ -61,12 +108,12 @@ fn base64urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 
     // Transform: replace + with -, / with _, and remove padding
     var j: usize = 0;
-    for (result) |c| {
-        switch (c) {
+    for (result) |ch| {
+        switch (ch) {
             '+' => encoded[j] = '-',
             '/' => encoded[j] = '_',
             '=' => continue, // Skip padding
-            else => encoded[j] = c,
+            else => encoded[j] = ch,
         }
         j += 1;
     }
@@ -194,12 +241,36 @@ pub const BenchmarkStats = struct {
     /// Average latency in microseconds.
     avg_latency_us: u64 = 0,
 
+    /// === NEW: Detailed tracking fields ===
+    /// Latency histogram buckets: <100µs, 100-200µs, 200-500µs, 500-1000µs, >1000µs
+    histogram: [5]u64 = [_]u64{0} ** 5,
+    /// Minimum latency
+    min_latency: u64 = std.math.maxInt(u64),
+    /// Maximum latency
+    max_latency: u64 = 0,
+    /// Median latency
+    median_latency: u64 = 0,
+    /// P90 latency
+    p90_latency: u64 = 0,
+    /// P95 latency
+    p95_latency: u64 = 0,
+    /// Size statistics
+    size_stats: SizeStats = .{},
+    /// Per-second throughput tracking (optional - for future use)
+    throughput_initialized: bool = false,
+
     /// Peak RSS in bytes (memory instrumentation).
     peak_rss_bytes: u64 = 0,
     /// Initial RSS in bytes.
     initial_rss_bytes: u64 = 0,
 
     const Self = @This();
+
+    /// Initialize benchmark stats
+    pub fn init(allocator: std.mem.Allocator) Self {
+        _ = allocator;
+        return Self{};
+    }
 
     /// Calculate statistics from latencies.
     pub fn calculate(self: *Self, latencies: []const u64, allocator: std.mem.Allocator) !void {
@@ -209,84 +280,293 @@ pub const BenchmarkStats = struct {
         const sorted = try allocator.alloc(u64, latencies.len);
         @memcpy(sorted, latencies);
         defer allocator.free(sorted);
-        // Simple insertion sort for small arrays
-        for (sorted, 1..) |_, i| {
-            var j = i;
-            while (j > 0 and sorted[j - 1] > sorted[j]) {
+        
+        // Simple stable sort using insertion sort (fixed boundary check)
+        var i: usize = 1;
+        while (i < sorted.len) {
+            var j: usize = i;
+            while (j > 0) {
+                if (j == 0) break;
+                if (sorted[j - 1] <= sorted[j]) break;
                 const temp = sorted[j];
                 sorted[j] = sorted[j - 1];
                 sorted[j - 1] = temp;
                 j -= 1;
             }
+            i += 1;
         }
 
         const idx = @divExact(sorted.len, 2);
         self.p50_latency_us = sorted[idx];
+        self.median_latency = sorted[idx];
 
-        const p99_idx = @divExact(sorted.len * 99, 100);
+        const p90_idx = @as(usize, @intFromFloat(@as(f64, @floatFromInt(sorted.len)) * 0.90));
+        const p95_idx = @as(usize, @intFromFloat(@as(f64, @floatFromInt(sorted.len)) * 0.95));
+        const p99_idx = @as(usize, @intFromFloat(@as(f64, @floatFromInt(sorted.len)) * 0.99));
+        const p999_idx = @as(usize, @intFromFloat(@as(f64, @floatFromInt(sorted.len)) * 0.999));
+
+        self.p90_latency = sorted[@min(p90_idx, sorted.len - 1)];
+        self.p95_latency = sorted[@min(p95_idx, sorted.len - 1)];
         self.p99_latency_us = sorted[@min(p99_idx, sorted.len - 1)];
-
-        const p999_idx = @divExact(sorted.len * 999, 1000);
         self.p999_latency_us = sorted[@min(p999_idx, sorted.len - 1)];
 
-        // Calculate average
+        // Calculate average and histogram buckets
         var sum: u64 = 0;
         for (sorted) |l| {
             sum += l;
+            
+            // Histogram buckets: <100µs, 100-200µs, 200-500µs, 500-1000µs, >1000µs
+            if (l < 100) self.histogram[0] += 1
+            else if (l < 200) self.histogram[1] += 1
+            else if (l < 500) self.histogram[2] += 1
+            else if (l < 1000) self.histogram[3] += 1
+            else self.histogram[4] += 1;
+            
+            if (l < self.min_latency) self.min_latency = l;
+            if (l > self.max_latency) self.max_latency = l;
         }
         self.avg_latency_us = sum / @as(u64, @intCast(sorted.len));
     }
 
-    /// Print benchmark results.
-    pub fn print(self: *const Self) void {
-        std.debug.print("Benchmark Results:\n", .{});
-        std.debug.print("  Total requests:  {d}\n", .{self.total_requests});
-        std.debug.print("  Successful:      {d}\n", .{self.successful});
-        std.debug.print("  Failed:          {d}\n", .{self.failed});
-        std.debug.print("  P50 latency:     {d} us\n", .{self.p50_latency_us});
-        std.debug.print("  P99 latency:     {d} us\n", .{self.p99_latency_us});
-        std.debug.print("  P999 latency:    {d} us\n", .{self.p999_latency_us});
-        std.debug.print("  Avg latency:     {d} us\n", .{self.avg_latency_us});
-        std.debug.print("  Memory (RSS):    {d} KB (peak: {d} KB)\n", .{
-            self.initial_rss_bytes / 1024,
-            self.peak_rss_bytes / 1024,
+    /// Print detailed benchmark results.
+    pub fn printDetailed(self: *const Self) void {
+        const total = self.total_requests;
+        
+        // 1. Summary
+        std.debug.print("\n=== Benchmark Results ===\n", .{});
+        std.debug.print("Total Requests:  {d}\n", .{total});
+        std.debug.print("Successful:      {d}\n", .{self.successful});
+        std.debug.print("Failed:          {d}\n\n", .{self.failed});
+        
+        // 2. Latency Details
+        std.debug.print("Latency Details (microseconds):\n", .{});
+        std.debug.print("  Min:       {d} us\n", .{if (self.min_latency == std.math.maxInt(u64)) 0 else self.min_latency});
+        std.debug.print("  Median:    {d} us\n", .{self.median_latency});
+        std.debug.print("  P50:       {d} us\n", .{self.p50_latency_us});
+        std.debug.print("  P90:       {d} us\n", .{self.p90_latency});
+        std.debug.print("  P95:       {d} us\n", .{self.p95_latency});
+        std.debug.print("  P99:       {d} us\n", .{self.p99_latency_us});
+        std.debug.print("  P99.9:     {d} us\n", .{self.p999_latency_us});
+        std.debug.print("  Max:       {d} us\n", .{self.max_latency});
+        std.debug.print("  Avg:       {d} us\n\n", .{self.avg_latency_us});
+        
+        // 3. Histogram
+        std.debug.print("Latency Distribution:\n", .{});
+        const buckets = [_][]const u8{"<100µs", "100-200µs", "200-500µs", "500-1000µs", ">1000µs"};
+        for (buckets, self.histogram) |name, count| {
+            const pct = if (total > 0) @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(total)) * 100 else 0;
+            std.debug.print("  {s:>10} [{s}] {d:>5} ({d:.1}%)\n", .{
+                name,
+                drawBar(count, total),
+                count,
+                pct
+            });
+        }
+        std.debug.print("\n", .{});
+        
+        // 4. Size Stats
+        std.debug.print("Size Statistics:\n", .{});
+        std.debug.print("  Avg Request:  {d} bytes\n", .{self.size_stats.avgRequestSize()});
+        std.debug.print("  Avg Response: {d} bytes\n", .{self.size_stats.avgResponseSize()});
+        std.debug.print("  Total TX:     {d} KB\n\n", .{
+            (self.size_stats.total_request_bytes + self.size_stats.total_response_bytes) / 1024
         });
+        
+        // 5. Memory
+        std.debug.print("Memory (RSS):\n", .{});
+        std.debug.print("  Initial:  {d} KB\n", .{self.initial_rss_bytes / 1024});
+        std.debug.print("  Peak:     {d} KB\n\n", .{self.peak_rss_bytes / 1024});
     }
 };
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Draw ASCII bar for histogram
+fn drawBar(count: u64, total: u64) [6]u8 {
+    // Calculate percentage as integer (basis points)
+    const bp = if (total > 0) count * 10000 / total else 0;
+    // Convert basis points to bar length (0-6)
+    // 10000 bp = 100%, 1666 bp per bar segment
+    const filled = @min(6, bp * 6 / 10000);
+    var result: [6]u8 = undefined;
+    for (0..6) |i| {
+        result[i] = if (i < filled) '#' else '-';
+    }
+return result;
+}
 
 // ============================================================================
 // HTTP Client using TCP sockets (Zig 0.5.2 compatible)
 // ============================================================================
 
-/// HTTP client wrapper using TCP sockets for load testing.
-pub const LoadTestClient = struct {
-    /// Host to connect to.
-    host: []u8,
-    /// Port to connect to.
-    port: u16,
-    /// Allocator.
-    allocator: std.mem.Allocator,
+/// Request result with latency and size info
+pub const RequestResult = struct {
+    latency_us: u64,
+    request_size: usize,
+    response_size: usize,
+};
 
-    const Self = @This();
+    /// Persistent HTTP client with keep-alive support
+    /// Reuses TCP connection across multiple requests
+    pub const PersistentClient = struct {
+        fd: c_int = -1,
+        host: []const u8,
+        port: u16,
 
-    /// Create a new load test client.
-    pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) !Self {
-        const host_copy = try allocator.dupe(u8, host);
-        return Self{
-            .host = host_copy,
-            .port = port,
-            .allocator = allocator,
-        };
-    }
+        const Self = @This();
 
-    /// Deinitialize the client.
-    pub fn deinit(self: *Self) void {
-        self.allocator.free(self.host);
-    }
+        /// Create and connect a persistent client
+        pub fn init(host: []const u8, port: u16) !Self {
+            return Self{
+                .host = host,
+                .port = port,
+                .fd = -1,
+            };
+        }
+
+        /// Connect the client (establish TCP connection)
+        pub fn connect(self: *Self) !void {
+            if (self.fd >= 0) return; // Already connected
+
+            self.fd = c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+            if (self.fd < 0) return error.SocketFailed;
+
+            // Use 127.0.0.1 (loopback)
+            var addr = std.posix.sockaddr.in{
+                .family = std.posix.AF.INET,
+                .port = @byteSwap(self.port),
+                .addr = @byteSwap(@as(u32, 0x7F000001)), // 127.0.0.1 in network byte order
+                .zero = [_]u8{0} ** 8,
+            };
+
+            if (c.connect(self.fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) {
+                _ = c.close(self.fd);
+                self.fd = -1;
+                return error.ConnectFailed;
+            }
+        }
+
+        /// Perform HTTP request using persistent connection
+        pub fn request(self: *Self, token: []const u8, path: []const u8) !RequestResult {
+            // Connect if not already connected
+            if (self.fd < 0) {
+                try self.connect();
+            }
+
+            const start_ns = std.time.nanoTimestamp();
+
+            // Build HTTP request with keep-alive
+            const request_str = try std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nAuthorization: Bearer {s}\r\nConnection: keep-alive\r\nAccept: application/json\r\n\r\n",
+                .{ path, self.host, self.port, token }
+            );
+            const request_size = request_str.len;
+            defer std.heap.page_allocator.free(request_str);
+
+            // Send request using POSIX write
+            var sent: usize = 0;
+            while (sent < request_str.len) {
+                const n = c.write(self.fd, request_str.ptr + sent, request_str.len - sent);
+                if (n <= 0) {
+                    // Connection broken, try to reconnect
+                    self.fd = -1;
+                    try self.connect();
+                    return error.WriteFailed;
+                }
+                sent += @as(usize, @intCast(n));
+            }
+
+            // Read response - read until connection close or buffer full
+            var response_buf: [4096]u8 = undefined;
+            var total_read: usize = 0;
+
+            while (total_read < response_buf.len) {
+                const n = c.read(self.fd, response_buf[total_read..].ptr, response_buf.len - total_read);
+                if (n <= 0) {
+                    // EOF or error - connection likely closed by server
+                    break;
+                }
+                total_read += @as(usize, @intCast(n));
+
+                // Check if we have complete response (look for end of headers)
+                if (total_read >= 4) {
+                    var i: usize = 0;
+                    while (i + 3 < total_read) {
+                        if (response_buf[i] == '\r' and response_buf[i+1] == '\n' and
+                            response_buf[i+2] == '\r' and response_buf[i+3] == '\n') {
+                            // Found end of headers, we have a complete response
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if (i + 3 < total_read) break;
+                }
+            }
+
+            const response_size = total_read;
+
+            const end_ns = std.time.nanoTimestamp();
+            const latency_us = @as(u64, @intCast(@divTrunc(end_ns - start_ns, 1000)));
+
+            return RequestResult{
+                .latency_us = latency_us,
+                .request_size = request_size,
+                .response_size = response_size,
+            };
+        }
+
+        /// Close the connection
+        pub fn close(self: *Self) void {
+            if (self.fd >= 0) {
+                _ = c.close(self.fd);
+                self.fd = -1;
+            }
+        }
+
+        /// Deinitialize - cleanup resources
+        pub fn deinit(self: *Self) void {
+            self.close();
+        }
+    };
+
+    /// HTTP client wrapper using TCP sockets for load testing.
+    pub const LoadTestClient = struct {
+        /// Host to connect to.
+        host: []u8,
+        /// Port to connect to.
+        port: u16,
+        /// Allocator.
+        allocator: std.mem.Allocator,
+        /// Persistent client for keep-alive
+        persistent: ?PersistentClient = null,
+
+        const Self = @This();
+
+        /// Create a new load test client.
+        pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) !Self {
+            const host_copy = try allocator.dupe(u8, host);
+            return Self{
+                .host = host_copy,
+                .port = port,
+                .allocator = allocator,
+                .persistent = null,
+            };
+        }
+
+        /// Deinitialize the client.
+        pub fn deinit(self: *Self) void {
+            if (self.persistent) |*p| {
+                p.deinit();
+            }
+            self.allocator.free(self.host);
+        }
 
 /// Perform a single HTTP GET request using TCP and measure latency.
-    /// Returns latency in microseconds on success, or error on failure.
-    pub fn request(_: *Self, token: []const u8) !u64 {
+/// Returns RequestResult with latency and size info.
+    pub fn request(_: *Self, token: []const u8) !RequestResult {
         const start_ns = std.time.nanoTimestamp();
 
         // Create TCP connection
@@ -294,26 +574,32 @@ pub const LoadTestClient = struct {
         const socket = try std.net.tcpConnectToAddress(address);
         defer socket.close();
 
-        // Build HTTP request
-        const path = "/v1/agents";
+        // Build HTTP request with keep-alive header
         const request_str = try std.fmt.allocPrint(
             std.heap.page_allocator,
-            "GET {s} HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAuthorization: Bearer {s}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-            .{ path, token }
+            "GET {s} HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAuthorization: Bearer {s}\r\nAccept: application/json\r\nConnection: keep-alive\r\n\r\n",
+            .{ "/v1/agents", token }
         );
+        const request_size = request_str.len;
         defer std.heap.page_allocator.free(request_str);
 
         // Send request
         try socket.writeAll(request_str);
 
-        // Read response headers (small read)
-        var response_buf: [512]u8 = undefined;
+        // Read response
+        var response_buf: [2048]u8 = undefined;
         const bytes_read = socket.read(&response_buf) catch 0;
-        _ = bytes_read;
+        const response_size = bytes_read;
 
         const end_ns = std.time.nanoTimestamp();
         // Return latency in microseconds using @divTrunc for i128 division
-        return @as(u64, @intCast(@divTrunc(end_ns - start_ns, 1000)));
+        const latency_us = @as(u64, @intCast(@divTrunc(end_ns - start_ns, 1000)));
+        
+        return RequestResult{
+            .latency_us = latency_us,
+            .request_size = request_size,
+            .response_size = response_size,
+        };
     }
 };
 
@@ -322,24 +608,39 @@ pub const LoadTestClient = struct {
 // ============================================================================
 
 /// Server process handle for load testing.
-/// Note: Server spawning is simplified - server must be running externally.
 pub const ServerProcess = struct {
     /// PID of the spawned server.
     pid: u32 = 0,
+    /// Process ID stored for killing later
+    pid_int: i32 = 0,
 
     const Self = @This();
 
-    /// Stub spawn - use runBenchmark with spawn_server=false
+    /// Spawn the server process and wait for it to be ready
+    /// Note: Auto-spawn requires server to be manually started in current version
     pub fn spawn(allocator: std.mem.Allocator, exe_path: []const u8, port: u16) !Self {
         _ = allocator;
         _ = exe_path;
-        _ = port;
-        return Self{ .pid = 0 };
+        std.debug.print("Note: Auto-spawn not implemented - start server manually\n", .{});
+        
+        // Wait for server to be ready (poll port)
+        var attempts: u32 = 0;
+        while (attempts < 50) {
+            std.Thread.sleep(100 * std.time.ns_per_ms); // 100ms
+            if (isPortReady("127.0.0.1", port)) {
+                std.debug.print("[Server ready]\n", .{});
+                return Self{ .pid = 0, .pid_int = 0 };
+            }
+            attempts += 1;
+        }
+        
+        return error.ServerNotReady;
     }
 
     /// Stop the server process.
     pub fn stop(self: *Self) void {
         _ = self;
+        // No-op for now
     }
 
     /// Get the PID of the server.
@@ -461,7 +762,7 @@ pub fn workerThread(
         const token = pool.next();
 
         // Make request - catch and count failures
-        const latency = client.request(token) catch |err| {
+        const req_result = client.request(token) catch |err| {
             failed += 1;
             request_count += 1;
             // Only print first few failures to avoid spam
@@ -473,8 +774,10 @@ pub fn workerThread(
 
         successful += 1;
         request_count += 1;
+        
+        // Store latency
         if (latencies_len < latencies_buf.len) {
-            latencies_buf[latencies_len] = latency;
+            latencies_buf[latencies_len] = req_result.latency_us;
             latencies_len += 1;
         }
 
@@ -498,7 +801,7 @@ pub fn runConcurrentBenchmark(
     pool: *JWTPool,
     config: WorkerConfig,
 ) !BenchmarkStats {
-    var stats = BenchmarkStats{};
+    var stats = BenchmarkStats.init(allocator);
 
     // Pre-allocate results array
     var results = try allocator.alloc(WorkerResult, config.num_workers);
@@ -536,31 +839,11 @@ pub fn runConcurrentBenchmark(
 
     // Brief pause to let workers start - skipped in Zig 0.17+
 
-    // Wait for completion
-    const timeout_ns = if (config.duration_secs > 0)
-        config.duration_secs * 1_000_000_000
-    else
-        30 * 1_000_000_000; // 30 second default for benchmarks
-
-    var timeout = false;
-    const start_wait = std.time.nanoTimestamp();
-    while (thread_count > 0) {
-        if (std.time.nanoTimestamp() - start_wait > timeout_ns) {
-            timeout = true;
-            break;
-        }
-        // Brief sleep to avoid busy-waiting
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-    }
-
-    if (timeout) {
-        std.debug.print("Warning: Benchmark timed out\n", .{});
-    }
-
-    // Join all threads
+    // Join all threads (blocks until all complete)
     for (threads[0..thread_count]) |t| {
         t.join();
     }
+    std.debug.print("All workers joined\n", .{});
 
     // Update memory instrumentation
     memory.updatePeak();
@@ -713,39 +996,51 @@ pub fn main() !void {
     // Run benchmark with config
     var config = BenchmarkConfig{};
     config.spawn_server = false;
-    config.num_workers = 10; // More workers for better concurrency
-    config.total_requests = 1000; // More requests for better statistics
-    config.duration_secs = 30; // 30 second max duration
+    config.num_workers = 8;
+    config.total_requests = 1000;
+    config.duration_secs = 60;
 
     std.debug.print("=== AgentGate Baseline Benchmark ===\n", .{});
     std.debug.print("Config: {} workers, {} requests\n", .{ config.num_workers, config.total_requests });
     std.debug.print("Target: http://127.0.0.1:{}\n", .{ config.port });
 
-    std.debug.print("Waiting for server to be ready...\n", .{});
-    
-    // Try to connect with retry
-    var connected = false;
-    for (0..30) |_| {
-        if (std.net.Address.parseIp("127.0.0.1", 8080)) |addr| {
-            if (std.net.tcpConnectToAddress(addr)) |socket| {
-                socket.close();
+    // Spawn server if enabled
+    var server: ?ServerProcess = null;
+    if (config.spawn_server) {
+        std.debug.print("\n", .{});
+        server = try ServerProcess.spawn(allocator, config.server_exe, config.port);
+        std.debug.print("Server started and ready!\n", .{});
+    } else {
+        // Wait for existing server
+        std.debug.print("Waiting for server to be ready...\n", .{});
+        
+        // Try to connect with retry
+        var connected = false;
+        for (0..60) |attempt| {
+            std.debug.print("  Attempt {d}/60...\n", .{attempt});
+            if (isPortReady("127.0.0.1", config.port)) {
                 connected = true;
                 break;
-            } else |_| {}
-        } else |_| {}
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+            }
+            std.Thread.sleep(500 * std.time.ns_per_ms);
+        }
+        
+        if (!connected) {
+            std.debug.print("[ERROR] Could not connect to server at 127.0.0.1:{}\n", .{config.port});
+            std.debug.print("Make sure the server is running: ./zig-out/bin/agent-gate\n", .{});
+            return error.ServerNotReady;
+        }
+        std.debug.print("Server is ready!\n", .{});
     }
     
-    if (!connected) {
-        std.debug.print("[ERROR] Could not connect to server at 127.0.0.1:8080\n", .{});
-        std.debug.print("Make sure the server is running: ./zig-out/bin/agent-gate\n", .{});
-        return error.ServerNotReady;
-    }
+    defer if (server) |*s| s.stop();
     
-    std.debug.print("Server is ready!\n\n", .{});
+    std.debug.print("\n", .{});
+    
+    // Create client and pool
     var client = try LoadTestClient.init(allocator, config.host, config.port);
     defer client.deinit();
-
+    
     var pool = try JWTPool.init(allocator, config.token_pool_size, config.jwt_secret);
     defer pool.deinit();
 
@@ -759,8 +1054,8 @@ pub fn main() !void {
     std.debug.print("Running benchmark...\n", .{});
     const stats = try runConcurrentBenchmark(allocator, &client, &pool, worker_config);
 
-    std.debug.print("\n=== Benchmark Results ===\n", .{});
-    stats.print();
+    // Use detailed output
+    stats.printDetailed();
 
     // Calculate throughput
     const duration_sec = @as(f64, @floatFromInt(stats.avg_latency_us * stats.total_requests)) / 1_000_000;
@@ -826,7 +1121,7 @@ test "JWTPool: get by index" {
 test "BenchmarkStats: calculate" {
     const gpa = std.testing.allocator;
     const latencies = &[_]u64{ 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 };
-    var stats = BenchmarkStats{};
+    var stats = BenchmarkStats.init(gpa);
     try stats.calculate(latencies[0..], gpa);
 
     try std.testing.expectEqual(@as(u64, 50), stats.p50_latency_us);
