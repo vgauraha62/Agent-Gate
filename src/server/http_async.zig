@@ -231,22 +231,36 @@ pub const Server = struct {
         }
         
         // Immediately read and respond (simplified for benchmark)
-        self.handleClientRequest(client_fd, read_buffer, write_buffer);
+        const start_time = std.time.nanoTimestamp();
+        const allowed = self.handleClientRequest(client_fd, read_buffer, write_buffer);
+        const end_time = std.time.nanoTimestamp();
+        const diff = end_time - start_time;
+        const latency_us = @as(u64, @intCast(@divTrunc(diff, 1000)));
+        prometheus.global_metrics.recordRequest(latency_us, allowed);
     }
     
     fn handleClientRead(self: *Self, fd: c_int, read_buffer: []u8, write_buffer: []u8) void {
+        // Start timing
+        const start_time = std.time.nanoTimestamp();
+
         const n = c.read(fd, read_buffer.ptr, read_buffer.len);
         if (n <= 0) {
             _ = c.epoll_ctl(self.epoll_fd, EPOLL_CTL_DEL, fd, null);
             _ = c.close(fd);
             return;
         }
-        
+
         self.total_requests += 1;
-        prometheus.global_metrics.incRequests();
-        
-        // Process request inline
-        self.handleClientRequest(fd, read_buffer[0..@as(usize, @intCast(n))], write_buffer);
+        // Note: requests_total is incremented by recordRequest() below - do NOT add incRequests() here
+
+        // Process request inline - get decision for metrics
+        const allowed = self.handleClientRequest(fd, read_buffer[0..@as(usize, @intCast(n))], write_buffer);
+
+        // Record latency
+        const end_time = std.time.nanoTimestamp();
+        const diff = end_time - start_time;
+        const latency_us = @as(u64, @intCast(@divTrunc(diff, 1000)));
+        prometheus.global_metrics.recordRequest(latency_us, allowed);
     }
     
     fn handleClientWrite(self: *Self, fd: c_int, write_buffer: []u8) void {
@@ -255,25 +269,43 @@ pub const Server = struct {
         _ = write_buffer;
     }
     
-    fn handleClientRequest(self: *Self, fd: c_int, request_data: []u8, write_buffer: []u8) void {
+    fn handleClientRequest(self: *Self, fd: c_int, request_data: []u8, write_buffer: []u8) bool {
         // Parse HTTP request
         const parsed = self.parseRequest(request_data) catch {
             self.sendError(fd, write_buffer, 400, "Invalid request");
-            return;
+            return false;
         };
-        
-        // Route and respond
+
+        // Route and respond - return whether request was allowed
         if (std.mem.eql(u8, parsed.path, "/health")) {
             self.sendStatic(fd, write_buffer, HEALTH_RESPONSE);
+            return false;
         } else if (std.mem.eql(u8, parsed.path, "/metrics")) {
             self.sendMetrics(fd, write_buffer);
+            return false;
         } else if (std.mem.eql(u8, parsed.path, "/v1/agents")) {
             self.sendStatic(fd, write_buffer, AGENTS_RESPONSE);
+            return false;
         } else if (std.mem.eql(u8, parsed.path, "/check") and std.mem.eql(u8, parsed.method, "POST")) {
-            self.sendJson(fd, write_buffer, "{\"allowed\":true}");
-            prometheus.global_metrics.incAllowed();
+            // Parse request body to get path
+            const body = request_data;
+            const check = parseCheckRequest(body);
+            
+            // Simple demo policy: deny paths starting with /admin or /secret or /system
+            const is_denied = std.mem.startsWith(u8, check.path, "/admin") or
+                              std.mem.startsWith(u8, check.path, "/secret") or
+                              std.mem.startsWith(u8, check.path, "/system");
+            
+            if (is_denied) {
+                self.sendJson(fd, write_buffer, "{\"allowed\":false,\"reason\":\"policy denied\",\"policy_id\":\"demo-deny-policy\"}");
+                return false;
+            } else {
+                self.sendJson(fd, write_buffer, "{\"allowed\":true}");
+                return true;
+            }
         } else {
             self.sendStatic(fd, write_buffer, NOT_FOUND_RESPONSE);
+            return false;
         }
     }
     
@@ -335,19 +367,44 @@ pub const Server = struct {
     }
     
     fn sendMetrics(self: *Self, fd: c_int, buffer: []u8) void {
+        _ = buffer; // Not used in this simplified implementation
         const metrics = prometheus.global_metrics.exportMetrics();
         
-        const header_len = std.fmt.bufPrint(buffer,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\n\r\n",
-            .{metrics.len}
-        ) catch return;
+        // Simple approach: write parts separately to avoid any buffer issues
+        const header1 = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ";
+        _ = c.write(fd, header1, header1.len);
         
-        const copy_len = @min(header_len.len + metrics.len, buffer.len);
-        @memcpy(buffer[header_len.len..copy_len], metrics[0..@min(metrics.len, copy_len - header_len.len)]);
+        // Write content-length as string manually
+        var len_buf: [16]u8 = undefined;
+        var len_pos: usize = 0;
+        var mlen = metrics.len;
+        if (mlen == 0) {
+            len_buf[0] = '0';
+            len_pos = 1;
+        } else {
+            while (mlen > 0) {
+                len_buf[len_pos] = '0' + @as(u8, @intCast(mlen % 10));
+                len_pos += 1;
+                mlen /= 10;
+            }
+        }
+        // Reverse
+        var i: usize = 0;
+        while (i < len_pos / 2) {
+            const tmp = len_buf[i];
+            len_buf[i] = len_buf[len_pos - 1 - i];
+            len_buf[len_pos - 1 - i] = tmp;
+            i += 1;
+        }
+        _ = c.write(fd, &len_buf, len_pos);
         
-        _ = c.write(fd, buffer.ptr, copy_len);
+        const header2 = "\r\n\r\n";
+        _ = c.write(fd, header2, header2.len);
         
-        // Close connection after response
+        // Write metrics
+        _ = c.write(fd, metrics.ptr, metrics.len);
+        
+        // Close connection
         _ = c.epoll_ctl(self.epoll_fd, EPOLL_CTL_DEL, fd, null);
         _ = c.close(fd);
     }
@@ -368,5 +425,41 @@ pub const Server = struct {
     fn runSyncPosix(self: *Self) !void {
         _ = self;
         @panic("Sync POSIX mode not implemented");
+    }
+
+    const CheckResult = struct {
+        path: []const u8,
+        method: []const u8,
+    };
+
+    /// Parse check request body - extract path and method from JSON
+    fn parseCheckRequest(body: []const u8) CheckResult {
+        var result = CheckResult{ .path = "/", .method = "GET" };
+        if (body.len == 0) return result;
+        
+        var i: usize = 0;
+        while (i + 5 < body.len) {
+            if (body[i] == '"' and body[i+1] == 'p' and body[i+2] == 'a' and
+                body[i+3] == 't' and body[i+4] == 'h' and body[i+5] == '"') {
+                var j = i + 6;
+                while (j < body.len and body[j] != ':') j += 1;
+                while (j < body.len and (body[j] == ':' or body[j] == ' ' or body[j] == '"')) j += 1;
+                const start = j;
+                while (j < body.len and body[j] != '"') j += 1;
+                if (j > start) result.path = body[start..j];
+            }
+            if (body[i] == '"' and i + 6 < body.len and
+                body[i+1] == 'm' and body[i+2] == 'e' and body[i+3] == 't' and
+                body[i+4] == 'h' and body[i+5] == 'o' and body[i+6] == 'd' and body[i+7] == '"') {
+                var j = i + 7;
+                while (j < body.len and body[j] != ':') j += 1;
+                while (j < body.len and (body[j] == ':' or body[j] == ' ' or body[j] == '"')) j += 1;
+                const start = j;
+                while (j < body.len and body[j] != '"') j += 1;
+                if (j > start) result.method = body[start..j];
+            }
+            i += 1;
+        }
+        return result;
     }
 };

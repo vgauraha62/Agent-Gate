@@ -35,69 +35,43 @@ Build a lightweight agent security sidecar in Zig. Prototype ready for acquisiti
 - [x] Basic routing
 - [x] Integration with Auth/Policy/Audit for `/check` endpoint
 
----
-
 ### Phase 6: End-to-End Request Processing & Concurrency (Complete)
+- [x] Full request lifecycle implementation.
+- [x] High-concurrency handling.
+- [x] Audit logs capture policy IDs and identities.
+- [x] Full flow latency <100µs.
 
-**Goal:** Seamlessly integrate Auth, Policy, and Audit modules. Resolve secret management and policy attribution gaps. Verify performance under concurrency.
-
-### Requirements
-- R1. Full request lifecycle implementation.
-- [x] R2. High-concurrency handling (epoll/worker distribution).
-- [x] R3. Audit logs capture specific policy IDs and agent identities.
-- [x] R4. Full flow latency <100µs.
-
-### Implementation Units (from docs/plans/2026-05-09-001-feat-day6-end-to-end-request-processing-plan.md)
-- [x] U1. **Detailed Policy Decisions**: Update `PolicyEngine.evaluate` to return `Decision` (Effect + Policy ID).
-- [x] U2. **Dynamic Secret Injection**: Inject `JWT_SECRET` via `Config` instead of hardcoding.
-- [x] U3. **Hardened Request Lifecycle**: Improve I/O error handling and resource cleanup in `src/server/http.zig`.
-- [x] U4. **E2E Integration Test Suite**: Create `src/integration_test_e2e.zig` to validate full path.
-- [x] U5. **Concurrency Stress Test**: Run high-load benchmarks (`scripts/stress_test_day6.sh`) to verify stability and P99 latency.
-
-### Dependencies
-- Day 5 Server foundation.
-- Day 4 Policy engine.
-- Day 3 Auth engine.
-
-### Verification
-- [x] `zig build test` passes (including E2E tests).
-- [x] Audit logs contain correct `policy_id`.
-- [x] Stress test shows stable memory and <100µs P99 latency.
+### Phase 7: Audit Logging System (Complete)
+- [x] Ring buffer audit log (`src/audit/logger.zig`).
+- [x] Merkle tree integrity mechanism.
+- [x] Cryptographic signing of root hash.
+- [x] Verification & Export methods.
 
 ---
 
-## Phase 7: Audit Logging System (Active)
+### Phase 8: Metrics & Monitoring (Active)
 
-**Goal:** Implement tamper-evident audit log with cryptographic verification.
+**Goal:** Implement Prometheus-compatible metrics endpoint for real-time observability.
 
 ### Requirements
-- R1. Ring buffer for high-performance logging.
-- R2. Merkle tree for integrity proof.
-- R3. Cryptographic signing of root hash.
-- R4. Support for export and verification.
+- R1. Atomic counters for `requests_total`, `allowed_total`, `denied_total`.
+- R2. HDR Histogram for request latency (P99 focus).
+- R3. Gauge for `active_sessions`.
+- R4. `/metrics` endpoint returning plaintext Prometheus format.
+- R5. Low-overhead recording (sub-microsecond).
 
-### Implementation Units (from PRD.md)
-- [ ] U1. **Ring Buffer Audit Log**: Implement `AuditLog` in `src/audit/logger.zig` with `LogEntry` (timestamp, agent_id, path, decision, request_hash).
-- [ ] U2. **Integrity Mechanism**: Implement Merkle tree root updates for each single entry.
-- [ ] U3. **Cryptographic Proof**: Sign new root with server private key after each entry.
-- [ ] U4. **Verification & Export**: Implement `verify()` and `export()` methods.
+### Implementation Units
+- [ ] U1. **Metrics Core**: Implement `Metrics` struct in `src/metrics/prometheus.zig` using `std.atomic`.
+- [ ] U2. **Latency Tracking**: Integrate HDR histogram for high-precision latency buckets.
+- [ ] U3. **Prometheus Exporter**: Implement `export()` method to write metrics in Prometheus text format.
+- [ ] U4. **HTTP Integration**: Add `/metrics` route to `src/server/http.zig` and link to `Metrics` instance.
+- [ ] U5. **Validation**: Verify output with `curl` and validate latency recording accuracy.
 
 ### Dependencies
-- Phase 6 E2E flow.
-- `std.crypto` for hashing and signing.
+- Phase 6/7 Server and Request flow.
+- `std.atomic` for lock-free counters.
 
 ### Verification
-- [ ] `zig build test` for audit log ring buffer wrap-around.
-- [ ] Verify tamper detection (modify entry $\rightarrow$ hash mismatch).
-- [ ] Verify cryptographic signature of Merkle root.
-
-## Errors Encountered
-| Error | Attempt | Resolution |
-|-------|---------|------------|
-| | | |
-
-## Decisions
-| Decision | Rationale |
-|----------|-----------|
-| Return `Decision` struct from Policy Engine | Needed for detailed audit logs (Policy ID attribution). |
-| Inject secrets via `Config` | Security: avoid hardcoded secrets; support rotation. |
+- [ ] `curl localhost:8080/metrics` returns valid Prometheus data.
+- [ ] Counters increment correctly under load.
+- [ ] P99 latency reflects real-world request timing.

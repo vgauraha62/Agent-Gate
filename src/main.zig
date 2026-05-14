@@ -4,6 +4,7 @@ const http = @import("server/http.zig");
 const http_async = @import("server/http_async.zig");
 const audit = @import("audit/logger.zig");
 const types = @import("policy/types.zig");
+const denial_tracker = @import("denial_tracker.zig");
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -30,6 +31,10 @@ pub fn main() !void {
         std.debug.print("[Startup] Config validation failed: {}\n", .{err});
         return err;
     };
+
+    // Initialize denial tracker for request visibility
+    try denial_tracker.initGlobal(allocator);
+    defer denial_tracker.deinitGlobal();
 
     var mode = http.ServerMode.async_epoll;
     var use_async_io = false;

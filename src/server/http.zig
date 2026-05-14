@@ -9,6 +9,7 @@ const posix = std.posix;
 const types = @import("../policy/types.zig");
 const audit = @import("../audit/logger.zig");
 const prometheus = @import("../metrics/prometheus.zig");
+const denial_tracker = @import("../denial_tracker.zig");
 
 // ============================================================
 // Constants
@@ -49,6 +50,7 @@ pub const HttpStatus = enum(u16) {
 pub const ParsedRequest = struct {
     method: []const u8,
     path: []const u8,
+    query: []const u8,
     body: []const u8,
 };
 
@@ -95,7 +97,10 @@ pub const Server = struct {
     // Statistics - using atomics for lock-free counters
     active_requests: std.atomic.Value(u32) = .init(0),
     total_requests: std.atomic.Value(u64) = .init(0),
-    
+
+    // Per-request state (set in handleRequestThread, used in defer)
+    last_request_allowed: bool = false,
+
     const Self = @This();
     
     // ============================================================
@@ -298,38 +303,60 @@ fn acceptConnections(self: *Self) void {
     // ============================================================
     
     fn handleRequestThread(self: *Self, client_fd: c_int) void {
+        // Start timing for latency tracking
+        const start_time = std.time.nanoTimestamp();
+
+        // Initialize allowed status - default to denied in case of early return
+        var allowed = false;
+
         defer {
+            // Calculate latency before cleanup
+            const end_time = std.time.nanoTimestamp();
+            const diff = end_time - start_time;
+            const latency_us = @as(u64, @intCast(@divTrunc(diff, 1000))); // Convert ns to us
+
+            // Record latency and decision using local variable
+            prometheus.global_metrics.recordRequest(latency_us, allowed);
+
             _ = self.active_requests.fetchSub(1, .release);
             _ = c.close(client_fd);
         }
-        
+
         _ = self.total_requests.fetchAdd(1, .monotonic);
-        
+
         // Read request
         var buffer: [READ_BUFFER_SIZE]u8 = undefined;
         const bytes_read = c.read(client_fd, &buffer, buffer.len);
-        
+
         if (bytes_read <= 0) return;
-        
-        prometheus.global_metrics.incRequests();
-        
+
+        // Note: requests_total is incremented in the deferred recordRequest() call below
+        // Do NOT add another incRequests() here - it would double-count
+
         const request_str = buffer[0..@as(usize, @intCast(bytes_read))];
-        
+
         // Parse request
         const parsed = parseHttpRequestFast(request_str) catch {
             sendErrorResponse(client_fd, .bad_request, "Invalid request");
             return;
         };
-        
-        // Route
+
+        // Route - track whether request was allowed
+        allowed = false; // Default to denied
+
         if (std.mem.eql(u8, parsed.path, "/health")) {
             sendHealthResponse(client_fd);
         } else if (std.mem.eql(u8, parsed.path, "/metrics")) {
             sendMetricsResponse(client_fd);
+        } else if (std.mem.eql(u8, parsed.path, "/denied-requests") and std.mem.eql(u8, parsed.method, "GET")) {
+            handleDeniedRequests(client_fd, parsed.query) catch {
+                sendErrorResponse(client_fd, .internal_error, "Failed to handle denied requests");
+                return;
+            };
         } else if (std.mem.eql(u8, parsed.path, "/v1/agents")) {
             sendAgentsListResponse(client_fd);
         } else if (std.mem.eql(u8, parsed.path, "/check") and std.mem.eql(u8, parsed.method, "POST")) {
-            handleCheckRequest(self, client_fd, parsed.body);
+            allowed = handleCheckRequest(self, client_fd, parsed.body);
         } else {
             sendNotFoundResponse(client_fd);
         }
@@ -343,11 +370,19 @@ fn acceptConnections(self: *Self) void {
         var line_end: usize = 0;
         while (line_end < buf.len and buf[line_end] != '\r') line_end += 1;
         if (line_end == 0) return error.InvalidRequest;
-        
+
         var parts = std.mem.splitSequence(u8, buf[0..line_end], " ");
         const method = parts.next() orelse return error.InvalidRequest;
-        const path = parts.next() orelse return error.InvalidRequest;
-        
+        const path_with_query = parts.next() orelse return error.InvalidRequest;
+
+        // Extract path and query
+        var query: []const u8 = "";
+        var path: []const u8 = path_with_query;
+        if (std.mem.indexOfScalar(u8, path_with_query, '?')) |q_idx| {
+            path = path_with_query[0..q_idx];
+            query = path_with_query[q_idx + 1 ..];
+        }
+
         // Find body
         var pos = line_end + 2;
         var body_start = pos;
@@ -359,12 +394,13 @@ fn acceptConnections(self: *Self) void {
             }
             pos += 1;
         }
-        
+
         const body = if (body_start < buf.len) buf[body_start..] else "";
-        
+
         return ParsedRequest{
             .method = method,
             .path = path,
+            .query = query,
             .body = body,
         };
     }
@@ -408,13 +444,108 @@ fn acceptConnections(self: *Self) void {
         return result;
     }
     
-    fn handleCheckRequest(self: *Self, client_fd: c_int, body: []const u8) void {
-        _ = parseCheckRequestFast(body); // Parse but ignore for benchmark
-        _ = self;
-        sendJsonResponse(client_fd, .ok, "{\"allowed\":true}");
-        prometheus.global_metrics.incAllowed();
+    fn handleCheckRequest(_: *Self, client_fd: c_int, body: []const u8) bool {
+        const check = parseCheckRequestFast(body);
+
+        // Simple demo policy: deny paths starting with /admin or /secret
+        // In production, this would use the full policy engine
+        const is_denied = std.mem.startsWith(u8, check.path, "/admin") or
+                          std.mem.startsWith(u8, check.path, "/secret") or
+                          std.mem.startsWith(u8, check.path, "/system");
+
+        if (is_denied) {
+            // Record the denial for audit
+            const timestamp_us = @as(i64, std.time.timestamp()) * 1_000_000;
+            const agent_id: [32]u8 = .{0} ** 32; // TODO: Extract from JWT/auth
+
+            const denial = denial_tracker.DenialRecord.init(
+                timestamp_us,
+                agent_id,
+                check.path,
+                check.method,
+                "demo-deny-policy",
+                .explicit_deny,
+            );
+            denial_tracker.getTracker().record(denial);
+
+            // Send denial response
+            sendJsonResponse(client_fd, .forbidden,
+                "{\"allowed\":false,\"reason\":\"policy denied\",\"policy_id\":\"demo-deny-policy\"}");
+            return false;
+        } else {
+            sendJsonResponse(client_fd, .ok, "{\"allowed\":true}");
+            return true;
+        }
     }
-    
+
+    // ============================================================
+    // Denied Requests Endpoint
+    // ============================================================
+
+    fn handleDeniedRequests(client_fd: c_int, query: []const u8) !void {
+        const tracker = denial_tracker.getTracker();
+
+        // Parse query parameters
+        var limit: usize = 100;
+        var filter_agent: ?[32]u8 = null;
+        var since_us: ?i64 = null;
+
+        if (query.len > 0) {
+            var parts = std.mem.splitSequence(u8, query, "&");
+            while (parts.next()) |part| {
+                var kv = std.mem.splitSequence(u8, part, "=");
+                const key = kv.next() orelse "";
+                const value = kv.next() orelse "";
+
+                if (std.mem.eql(u8, key, "limit")) {
+                    limit = std.fmt.parseInt(usize, value, 10) catch 100;
+                    limit = @min(limit, 1000);
+                } else if (std.mem.eql(u8, key, "agent")) {
+                    // Parse hex to bytes (64 hex chars = 32 bytes)
+                    if (value.len == 64) {
+                        var bytes: [32]u8 = undefined;
+                        _ = std.fmt.hexToBytes(&bytes, value) catch continue;
+                        filter_agent = bytes;
+                    }
+                } else if (std.mem.eql(u8, key, "since")) {
+                    since_us = std.fmt.parseInt(i64, value, 10) catch null;
+                }
+            }
+        }
+
+        // Get denials (returns owned copies)
+        const denials = try tracker.getRecent(limit, filter_agent, since_us);
+        defer tracker.allocator.free(denials);
+
+        // Build JSON response
+        var buf = try std.ArrayList(u8).initCapacity(tracker.allocator, 4096);
+        defer buf.deinit(tracker.allocator);
+
+        try buf.writer(tracker.allocator).print("{{\"total\":{},\"denials\":[", .{tracker.getTotalDenials()});
+
+        for (denials, 0..) |d, i| {
+            if (i > 0) {
+                try buf.writer(tracker.allocator).writeAll(",");
+            }
+
+            const agent_hex = std.fmt.bytesToHex(d.agent_id, .lower);
+            try buf.writer(tracker.allocator).print(
+                \\{{"timestamp":{},"agent_id":"{s}","path":"{s}","method":"{s}","policy_id":"{s}","reason":"{s}"}}
+            , .{
+                d.timestamp_us,
+                agent_hex,
+                d.getPath(),
+                d.getMethod(),
+                d.getPolicyId(),
+                @tagName(d.reason),
+            });
+        }
+
+        try buf.writer(tracker.allocator).writeAll("]}");
+
+        sendJsonResponse(client_fd, .ok, buf.items);
+    }
+
     // ============================================================
     // Response Helpers
     // ============================================================
@@ -426,32 +557,39 @@ fn acceptConnections(self: *Self) void {
     fn sendMetricsResponse(client_fd: c_int) void {
         const metrics = prometheus.global_metrics.exportMetrics();
         
-        // Build response in a single buffer to avoid multiple syscalls
-        var response_buf: [512]u8 = undefined;
-        const header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ";
+        // Simple approach: write parts separately
+        const header1 = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ";
+        _ = c.write(client_fd, header1, header1.len);
         
-        // Format: header + length + \r\n\r\n + metrics
-        const len_str = std.fmt.bufPrint(&response_buf, "{d}\r\n\r\n", .{metrics.len}) catch return;
-        
-        // Calculate total response size
-        const header_len = header.len + len_str.len;
-        const total_len = header_len + metrics.len;
-        
-        // Build response inline in a buffer (single write)
-        var full_response: [1024]u8 = undefined;
-        if (total_len > full_response.len) {
-            // Fallback to original if response is too large
-            _ = c.write(client_fd, header, header.len);
-            _ = c.write(client_fd, len_str.ptr, len_str.len);
-            _ = c.write(client_fd, metrics.ptr, metrics.len);
-            return;
+        // Write content-length as string manually
+        var len_buf: [16]u8 = undefined;
+        var len_pos: usize = 0;
+        var mlen = metrics.len;
+        if (mlen == 0) {
+            len_buf[0] = '0';
+            len_pos = 1;
+        } else {
+            while (mlen > 0) {
+                len_buf[len_pos] = '0' + @as(u8, @intCast(mlen % 10));
+                len_pos += 1;
+                mlen /= 10;
+            }
         }
+        // Reverse
+        var i: usize = 0;
+        while (i < len_pos / 2) {
+            const tmp = len_buf[i];
+            len_buf[i] = len_buf[len_pos - 1 - i];
+            len_buf[len_pos - 1 - i] = tmp;
+            i += 1;
+        }
+        _ = c.write(client_fd, &len_buf, len_pos);
         
-        @memcpy(full_response[0..header_len], header);
-        @memcpy(full_response[header_len..header_len + len_str.len], len_str);
-        @memcpy(full_response[header_len + len_str.len..][0..metrics.len], metrics);
+        const header2 = "\r\n\r\n";
+        _ = c.write(client_fd, header2, header2.len);
         
-        _ = c.write(client_fd, &full_response, total_len);
+        // Write metrics
+        _ = c.write(client_fd, metrics.ptr, metrics.len);
     }
     
     fn sendAgentsListResponse(client_fd: c_int) void {
@@ -475,7 +613,7 @@ fn acceptConnections(self: *Self) void {
         // Combine into single buffer and write once
         const total_len = header.len + body.len;
         var response: [512]u8 = undefined;
-        @memcpy(&response, header);
+        @memcpy(response[0..header.len], header);
         @memcpy(response[header.len..][0..body.len], body);
         _ = c.write(client_fd, &response, total_len);
     }
@@ -489,10 +627,16 @@ fn acceptConnections(self: *Self) void {
         
         // Combine into single buffer and write once
         const total_len = header.len + json.len;
-        var response: [512]u8 = undefined;
-        @memcpy(&response, header);
-        @memcpy(response[header.len..][0..json.len], json);
-        _ = c.write(client_fd, &response, total_len);
+        if (total_len <= 2048) {
+            var response: [2048]u8 = undefined;
+            @memcpy(response[0..header.len], header);
+            @memcpy(response[header.len..][0..json.len], json);
+            _ = c.write(client_fd, &response, total_len);
+        } else {
+            // For large responses, write in two parts
+            _ = c.write(client_fd, header.ptr, header.len);
+            _ = c.write(client_fd, json.ptr, json.len);
+        }
     }
     
     fn runSyncPosix(self: *Self) !void {
