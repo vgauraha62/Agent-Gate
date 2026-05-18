@@ -10,13 +10,20 @@ const types = @import("../policy/types.zig");
 const audit = @import("../audit/logger.zig");
 const prometheus = @import("../metrics/prometheus.zig");
 const denial_tracker = @import("../denial_tracker.zig");
+const mtls = @import("../auth/mTLS.zig");
+
+// Import config for TLSMode
+const config = @import("../config.zig");
+
+// Compile-time flags
+const ENABLE_DEBUG_LOGS = false;  // Disable debug logging in production
 
 // ============================================================
 // Constants
 // ============================================================
 
-const MAX_CONCURRENT_REQUESTS = 256;    // Bounded thread pool
-const SOCKET_BACKLOG = 4096;            // Listen backlog
+const MAX_CONCURRENT_REQUESTS = 1024;  // Increased to handle more concurrent requests
+const SOCKET_BACKLOG = 8192;            // Listen backlog (increased for higher throughput)
 const EPOLL_MAX_EVENTS = 256;           // Events per epoll_wait
 const READ_BUFFER_SIZE = 8192;           // HTTP request buffer
 const EPOLLIN: u32 = 0x001;
@@ -27,12 +34,12 @@ const EPOLL_CTL_MOD: c_int = 2;
 const EPOLL_CTL_DEL: c_int = 3;
 
 // Pre-allocated static HTTP responses (zero-allocation)
-const HEALTH_RESPONSE = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-const AGENTS_RESPONSE = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
-const NOT_FOUND_RESPONSE = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found";
-const JSON_OK_RESPONSE = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"allowed\":true}";
-const JSON_BAD_REQUEST_RESPONSE = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 21\r\n\r\n{\"error\":\"Invalid request\"}";
-const JSON_UNAUTHORIZED_RESPONSE = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 30\r\n\r\n{\"error\":\"missing authorization header\"}";
+const HEALTH_RESPONSE = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
+const AGENTS_RESPONSE = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n[]";
+const NOT_FOUND_RESPONSE = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nnot found";
+const JSON_OK_RESPONSE = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: keep-alive\r\n\r\n{\"allowed\":true}";
+const JSON_BAD_REQUEST_RESPONSE = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 21\r\nConnection: keep-alive\r\n\r\n{\"error\":\"Invalid request\"}";
+const JSON_UNAUTHORIZED_RESPONSE = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 30\r\nConnection: keep-alive\r\n\r\n{\"error\":\"missing authorization header\"}";
 
 // ============================================================
 // Public Types
@@ -52,6 +59,8 @@ pub const ParsedRequest = struct {
     path: []const u8,
     query: []const u8,
     body: []const u8,
+    headers: []const u8, // Raw headers for keep-alive detection
+    keep_alive: bool,   // Detected during parsing (single pass)
 };
 
 pub const ServerMode = enum {
@@ -72,6 +81,189 @@ pub const CheckRequest = struct {
     method: []const u8,
 };
 
+// ============================================================================
+// SSL/TLS Header Parsing for External mTLS Mode
+// ============================================================================
+
+/// SSL client information parsed from X-SSL headers (set by nginx).
+pub const SSLClientInfo = struct {
+    /// SHA256 fingerprint (computed from PEM or 64 hex chars).
+    fingerprint: [32]u8,
+    /// SHA1 fingerprint (40 hex chars from nginx - optional).
+    fingerprint_sha1: [20]u8,
+    /// Whether nginx successfully verified the client certificate.
+    verified: bool,
+    /// Optional: Client certificate serial number.
+    serial: []const u8,
+    /// Optional: Subject Common Name from client certificate.
+    subject_cn: []const u8,
+    /// Full PEM-encoded client certificate (primary source for agent_id).
+    pem_cert: []const u8,
+
+    const Self = @This();
+
+    /// Check if this SSL info is valid (verified AND has identity source).
+    pub fn isValid(self: *const Self) bool {
+        return self.verified and (
+            !self.isFingerprintZero() or
+            !self.isFingerprintSHA1Zero() or
+            self.pem_cert.len > 0
+        );
+    }
+
+    /// Check if SHA256 fingerprint is all zeros.
+    pub fn isFingerprintZero(self: *const Self) bool {
+        for (self.fingerprint) |b| {
+            if (b != 0) return false;
+        }
+        return true;
+    }
+
+    /// Check if SHA1 fingerprint is all zeros.
+    pub fn isFingerprintSHA1Zero(self: *const Self) bool {
+        for (self.fingerprint_sha1) |b| {
+            if (b != 0) return false;
+        }
+        return true;
+    }
+
+    /// Convert SSL info to agent_id with priority order:
+    /// 1. SHA256 fingerprint (if available)
+    /// 2. SHA1 fingerprint expanded to 32 bytes (if available)
+    /// 3. Caller must compute from PEM using deriveAgentIdFromPEM()
+    pub fn toAgentId(self: *const Self) ?[32]u8 {
+        // Priority 1: SHA256 fingerprint (most secure)
+        if (!self.isFingerprintZero()) {
+            return self.fingerprint;
+        }
+
+        // Priority 2: SHA1 fingerprint expanded (fallback)
+        if (!self.isFingerprintSHA1Zero()) {
+            var expanded: [32]u8 = .{0} ** 32;
+            @memcpy(expanded[0..20], &self.fingerprint_sha1);
+            return expanded;
+        }
+
+        // Priority 3: Caller must compute from PEM
+        return null;
+    }
+};
+
+/// Parse X-SSL headers from nginx proxy.
+/// Expected headers:
+/// - X-SSL-Client-Verify: SUCCESS or FAILED (REQUIRED)
+/// - X-SSL-Client-Cert: Full PEM certificate (PRIMARY - compute SHA256 from this)
+/// - X-SSL-Client-Fingerprint: SHA1 fingerprint (40 hex chars - fallback)
+/// - X-SSL-Client-Serial: Optional certificate serial
+/// - X-SSL-Client-CN: Optional subject CN
+pub fn parseSSLHeaders(headers: []const u8) ?SSLClientInfo {
+    var info = SSLClientInfo{
+        .fingerprint = .{0} ** 32,
+        .fingerprint_sha1 = .{0} ** 20,
+        .verified = false,
+        .serial = "",
+        .subject_cn = "",
+        .pem_cert = "",
+    };
+
+    // Parse X-SSL-Client-Verify (REQUIRED - determines if we have valid cert)
+    if (extractHeaderValue(headers, "X-SSL-Client-Verify")) |value| {
+        info.verified = std.mem.eql(u8, value, "SUCCESS");
+    }
+
+    // Parse X-SSL-Client-Cert (PRIMARY - full PEM for SHA256 computation)
+    if (extractHeaderValue(headers, "X-SSL-Client-Cert")) |pem| {
+        if (pem.len > 0) {
+            info.pem_cert = pem;
+        }
+    }
+
+    // Parse X-SSL-Client-Fingerprint - could be SHA1 (40 chars) or SHA256 (64 chars)
+    if (extractHeaderValue(headers, "X-SSL-Client-Fingerprint")) |fingerprint_hex| {
+        // Strip "SHA1:" prefix if present (nginx format)
+        const clean_hex = if (std.mem.startsWith(u8, fingerprint_hex, "SHA1:"))
+            fingerprint_hex[5..]
+        else
+            fingerprint_hex;
+
+        if (clean_hex.len == 40) {
+            // SHA1 fingerprint (40 hex chars = 20 bytes)
+            _ = std.fmt.hexToBytes(&info.fingerprint_sha1, clean_hex) catch {
+                // Invalid hex, leave as zero
+            };
+        } else if (clean_hex.len == 64) {
+            // SHA256 fingerprint (64 hex chars = 32 bytes)
+            _ = std.fmt.hexToBytes(&info.fingerprint, clean_hex) catch {
+                // Invalid hex, leave as zero
+            };
+        }
+    }
+
+    // Parse optional X-SSL-Client-Serial
+    if (extractHeaderValue(headers, "X-SSL-Client-Serial")) |serial| {
+        info.serial = serial;
+    }
+
+    // Parse optional X-SSL-Client-CN
+    if (extractHeaderValue(headers, "X-SSL-Client-CN")) |cn| {
+        info.subject_cn = cn;
+    }
+
+    // Only return info if verified and has some identity
+    if (!info.isValid()) {
+        return null;
+    }
+
+    return info;
+}
+
+/// Extract a header value from raw HTTP headers.
+/// Returns the value part (after the colon) or null if not found.
+fn extractHeaderValue(headers: []const u8, header_name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + header_name.len < headers.len) : (i += 1) {
+        // Case-insensitive header name match
+        if (std.ascii.toLower(headers[i]) == std.ascii.toLower(header_name[0])) {
+            if (i + header_name.len <= headers.len and
+                std.mem.eql(u8, headers[i..][0..header_name.len], header_name)) {
+                // Found header, skip to colon
+                var j = i + header_name.len;
+                while (j < headers.len and headers[j] != ':') j += 1;
+                if (j >= headers.len) return null;
+
+                // Skip colon and whitespace
+                j += 1;
+                while (j < headers.len and (headers[j] == ' ' or headers[j] == '\t')) j += 1;
+
+                // Find end of value (CRLF)
+                var value_end = j;
+                while (value_end < headers.len and
+                    headers[value_end] != '\r' and headers[value_end] != '\n') {
+                    value_end += 1;
+                }
+
+                return headers[j..value_end];
+            }
+        }
+    }
+    return null;
+}
+
+/// Derive agent_id from PEM certificate (fallback when fingerprint header unavailable).
+/// Uses SHA256 of the PEM certificate bytes.
+pub fn deriveAgentIdFromPEM(pem_cert: []const u8) ?[32]u8 {
+    if (pem_cert.len == 0) return null;
+    return mtls.deriveAgentId(pem_cert);
+}
+
+/// Check if an agent_id array is all zeros.
+pub fn isAgentIdZero(agent_id: [32]u8) bool {
+    for (agent_id) |b| {
+        if (b != 0) return false;
+    }
+    return true;
+}
+
 // ============================================================
 // Server Core
 // ============================================================
@@ -83,17 +275,22 @@ pub const Server = struct {
     policies: []const types.Policy,
     secret_key: []const u8,
     mode: ServerMode = .async_epoll,
-    
+
+    // TLS mode for external mTLS support
+    tls_mode: config.TLSMode = .disabled,
+    require_ssl_headers: bool = true,
+    external_policy: config.ExternalPolicy = .strict,
+
     // Socket descriptors
     epoll_fd: c_int = -1,
     listen_fd: c_int = -1,
-    
+
     // Thread management
     shutdown: bool = false,
     shutdown_lock: std.Thread.Mutex = .{},
     thread_pool: std.Thread.Pool = undefined,
     thread_pool_initialized: bool = false,
-    
+
     // Statistics - using atomics for lock-free counters
     active_requests: std.atomic.Value(u32) = .init(0),
     total_requests: std.atomic.Value(u64) = .init(0),
@@ -114,6 +311,9 @@ pub const Server = struct {
         policies: []const types.Policy,
         secret_key: []const u8,
         mode: ServerMode,
+        tls_mode: config.TLSMode,
+        require_ssl_headers: bool,
+        external_policy: config.ExternalPolicy,
     ) Self {
         return Self{
             .allocator = allocator,
@@ -122,6 +322,9 @@ pub const Server = struct {
             .policies = policies,
             .secret_key = secret_key,
             .mode = mode,
+            .tls_mode = tls_mode,
+            .require_ssl_headers = require_ssl_headers,
+            .external_policy = external_policy,
         };
     }
     
@@ -162,7 +365,7 @@ pub const Server = struct {
     pub fn run(self: *Self) !void {
         // Initialize thread pool
         const cpu_count = try std.Thread.getCpuCount();
-        const thread_count = @min(MAX_CONCURRENT_REQUESTS, cpu_count * 2);
+        const thread_count = @min(MAX_CONCURRENT_REQUESTS, cpu_count * 2);  // 8 threads (4 cores * 2)
         
         try self.thread_pool.init(.{
             .allocator = self.allocator,
@@ -264,7 +467,7 @@ fn acceptConnections(self: *Self) void {
                 // Accept failed - could be EAGAIN or error, exit anyway
                 break;
             }
-            
+
             accepted += 1;
             
             // Add to epoll with edge-triggered mode
@@ -281,18 +484,9 @@ fn acceptConnections(self: *Self) void {
     fn handleClientAsync(self: *Self, client_fd: c_int) void {
         // Remove from epoll (thread will own it)
         _ = c.epoll_ctl(self.epoll_fd, EPOLL_CTL_DEL, client_fd, null);
-        
-        // Atomic increment - simple approach
-        const count = self.active_requests.fetchAdd(1, .acq_rel);
-        if (count >= MAX_CONCURRENT_REQUESTS) {
-            _ = self.active_requests.fetchSub(1, .release);
-            _ = c.close(client_fd);
-            return;
-        }
-        
-        // Spawn to thread pool
+
+        // Spawn to thread pool - let pool handle backpressure
         self.thread_pool.spawn(handleRequestThread, .{self, client_fd}) catch |err| {
-            _ = self.active_requests.fetchSub(1, .release);
             std.log.err("Thread spawn failed: {}", .{err});
             _ = c.close(client_fd);
         };
@@ -301,65 +495,133 @@ fn acceptConnections(self: *Self) void {
     // ============================================================
     // Request Processing Thread
     // ============================================================
-    
-    fn handleRequestThread(self: *Self, client_fd: c_int) void {
-        // Start timing for latency tracking
-        const start_time = std.time.nanoTimestamp();
 
-        // Initialize allowed status - default to denied in case of early return
+    fn handleRequestThread(self: *Self, client_fd: c_int) void {
+        // Track active requests
+        _ = self.active_requests.fetchAdd(1, .acq_rel);
         var allowed = false;
 
-        defer {
-            // Calculate latency before cleanup
-            const end_time = std.time.nanoTimestamp();
-            const diff = end_time - start_time;
-            const latency_us = @as(u64, @intCast(@divTrunc(diff, 1000))); // Convert ns to us
-
-            // Record latency and decision using local variable
-            prometheus.global_metrics.recordRequest(latency_us, allowed);
-
-            _ = self.active_requests.fetchSub(1, .release);
-            _ = c.close(client_fd);
-        }
-
-        _ = self.total_requests.fetchAdd(1, .monotonic);
-
-        // Read request
+        // Keep-alive loop: handle multiple requests on same connection
+        var requests_served: usize = 0;
+        const max_requests_per_conn = 100; // Safety limit
         var buffer: [READ_BUFFER_SIZE]u8 = undefined;
-        const bytes_read = c.read(client_fd, &buffer, buffer.len);
 
-        if (bytes_read <= 0) return;
+        while (requests_served < max_requests_per_conn) {
+            // Read request
+            const bytes_read = c.read(client_fd, &buffer, buffer.len);
 
-        // Note: requests_total is incremented in the deferred recordRequest() call below
-        // Do NOT add another incRequests() here - it would double-count
+            if (bytes_read <= 0) {
+                // Connection closed or error - exit loop
+                break;
+            }
 
-        const request_str = buffer[0..@as(usize, @intCast(bytes_read))];
+            // Track timing for this request
+            const req_start = std.time.nanoTimestamp();
 
-        // Parse request
-        const parsed = parseHttpRequestFast(request_str) catch {
-            sendErrorResponse(client_fd, .bad_request, "Invalid request");
-            return;
-        };
+            const request_str = buffer[0..@as(usize, @intCast(bytes_read))];
 
-        // Route - track whether request was allowed
-        allowed = false; // Default to denied
-
-        if (std.mem.eql(u8, parsed.path, "/health")) {
-            sendHealthResponse(client_fd);
-        } else if (std.mem.eql(u8, parsed.path, "/metrics")) {
-            sendMetricsResponse(client_fd);
-        } else if (std.mem.eql(u8, parsed.path, "/denied-requests") and std.mem.eql(u8, parsed.method, "GET")) {
-            handleDeniedRequests(client_fd, parsed.query) catch {
-                sendErrorResponse(client_fd, .internal_error, "Failed to handle denied requests");
-                return;
+            // Parse request
+            const parsed = parseHttpRequestFast(request_str) catch {
+                // Invalid request - close connection
+                break;
             };
-        } else if (std.mem.eql(u8, parsed.path, "/v1/agents")) {
-            sendAgentsListResponse(client_fd);
-        } else if (std.mem.eql(u8, parsed.path, "/check") and std.mem.eql(u8, parsed.method, "POST")) {
-            allowed = handleCheckRequest(self, client_fd, parsed.body);
-        } else {
-            sendNotFoundResponse(client_fd);
+
+            // Keep-alive already detected in single pass during parsing
+            const keep_alive = parsed.keep_alive;
+
+            // ============================================================
+            // SSL Header Parsing for External mTLS Mode
+            // ============================================================
+            var agent_id: [32]u8 = .{0} ** 32;
+            var has_valid_identity = false;
+
+            // Parse SSL headers from nginx (only in external mode)
+            if (self.tls_mode == .external or self.tls_mode == .native) {
+                if (parseSSLHeaders(parsed.headers)) |ssl_info| {
+                    // Priority 1: SHA256 fingerprint (64 hex chars from header or PEM computation)
+                    if (ssl_info.toAgentId()) |derived_id| {
+                        agent_id = derived_id;
+                        has_valid_identity = true;
+                        if (ENABLE_DEBUG_LOGS) {
+                            std.log.debug("Agent ID from fingerprint: {s}", .{
+                                std.fmt.bytesToHex(agent_id, .lower)
+                            });
+                        }
+                    } else if (ssl_info.pem_cert.len > 0) {
+                        // Priority 2: Compute from PEM certificate (primary method)
+                        if (deriveAgentIdFromPEM(ssl_info.pem_cert)) |computed_id| {
+                            agent_id = computed_id;
+                            has_valid_identity = true;
+                            if (ENABLE_DEBUG_LOGS) {
+                                std.log.debug("Agent ID from PEM: {s}", .{
+                                    std.fmt.bytesToHex(agent_id, .lower)
+                                });
+                            }
+                        }
+                    } else if (!ssl_info.isFingerprintSHA1Zero()) {
+                        // Priority 3: SHA1 fingerprint (expand to 32 bytes)
+                        @memcpy(agent_id[0..20], &ssl_info.fingerprint_sha1);
+                        has_valid_identity = true;
+                        if (ENABLE_DEBUG_LOGS) {
+                            std.log.debug("Agent ID from SHA1: {s}", .{
+                                std.fmt.bytesToHex(agent_id, .lower)
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Security check: in external mode with require_ssl_headers, reject if no valid identity
+            const needs_auth = self.tls_mode == .external and self.require_ssl_headers;
+            const is_public_endpoint = std.mem.eql(u8, parsed.path, "/health") or
+                std.mem.eql(u8, parsed.path, "/metrics") or
+                std.mem.eql(u8, parsed.path, "/denied-requests") or
+                std.mem.eql(u8, parsed.path, "/v1/agents");
+
+            // Route - track whether request was allowed
+            allowed = false;
+
+            if (std.mem.eql(u8, parsed.path, "/health")) {
+                // Hot path - no metrics
+                sendHealthResponse(client_fd);
+            } else if (std.mem.eql(u8, parsed.path, "/metrics")) {
+                sendMetricsResponse(client_fd);
+            } else if (std.mem.eql(u8, parsed.path, "/denied-requests") and std.mem.eql(u8, parsed.method, "GET")) {
+                handleDeniedRequests(client_fd, parsed.query) catch {
+                    sendErrorResponse(client_fd, .internal_error, "Failed to handle denied requests");
+                    break;
+                };
+            } else if (std.mem.eql(u8, parsed.path, "/v1/agents")) {
+                // Hot path - no metrics
+                sendAgentsListResponse(client_fd);
+            } else if (std.mem.eql(u8, parsed.path, "/check") and std.mem.eql(u8, parsed.method, "POST")) {
+                // Security check: reject in external mode if no valid identity
+                if (needs_auth and !is_public_endpoint and !has_valid_identity) {
+                    // Reject request - SSL headers required in external mode
+                    sendJsonResponse(client_fd, .forbidden,
+                        "{\"error\":\"SSL headers required in external TLS mode\"}");
+                    allowed = false;
+                } else {
+                    allowed = handleCheckRequest(self, client_fd, parsed.body, agent_id);
+                }
+                // Only record metrics for policy decisions
+                const req_end = std.time.nanoTimestamp();
+                const latency_us = @as(u64, @intCast(@divTrunc(req_end - req_start, 1000)));
+                prometheus.global_metrics.recordRequest(latency_us, allowed);
+                _ = self.total_requests.fetchAdd(1, .monotonic);
+            } else {
+                sendNotFoundResponse(client_fd);
+            }
+
+            requests_served += 1;
+
+            // If client didn't request keep-alive, exit loop
+            if (!keep_alive) break;
         }
+
+        // Cleanup - always close when done
+        _ = self.active_requests.fetchSub(1, .release);
+        _ = c.close(client_fd);
     }
     
     // ============================================================
@@ -383,18 +645,33 @@ fn acceptConnections(self: *Self) void {
             query = path_with_query[q_idx + 1 ..];
         }
 
-        // Find body
+        // Find body and detect keep-alive in single pass
         var pos = line_end + 2;
         var body_start = pos;
+        var keep_alive = false;
+
+        // Check if hot path (for optimization)
+        const is_hot_path = path.len > 1 and (path[1] == 'v' or path[1] == 'h' or path[1] == 'm');
+
         while (pos + 3 < buf.len) {
             if (buf[pos] == '\r' and buf[pos+1] == '\n' and
                 buf[pos+2] == '\r' and buf[pos+3] == '\n') {
                 body_start = pos + 4;
+
+                // Only scan for keep-alive if not hot path
+                if (!is_hot_path) {
+                    const headers_slice = buf[line_end + 2 .. pos];
+                    keep_alive = detectKeepAlive(headers_slice);
+                } else {
+                    keep_alive = true; // Hot paths assume keep-alive
+                }
                 break;
             }
             pos += 1;
         }
 
+        // Extract headers (between request line and body)
+        const headers = if (pos > line_end + 2) buf[line_end + 2 .. pos] else "";
         const body = if (body_start < buf.len) buf[body_start..] else "";
 
         return ParsedRequest{
@@ -402,9 +679,82 @@ fn acceptConnections(self: *Self) void {
             .path = path,
             .query = query,
             .body = body,
+            .headers = headers,
+            .keep_alive = keep_alive,
         };
     }
-    
+
+    /// Detect keep-alive from headers (single pass, called from parseHttpRequestFast)
+    inline fn detectKeepAlive(headers: []const u8) bool {
+        // Quick scan for "Connection: keep-alive"
+        var i: usize = 0;
+        while (i + 12 < headers.len) : (i += 1) {
+            if (headers[i] == 'C' or headers[i] == 'c') {
+                if (i + 12 <= headers.len and headers[i..i+12].len == 12) {
+                    // Check if it's "Connection:" (12 chars)
+                    const slice = headers[i..i+12];
+                    if (slice[0] == 'C' and slice[1] == 'o' and slice[2] == 'n' and
+                        slice[3] == 'n' and slice[4] == 'e' and slice[5] == 'c' and
+                        slice[6] == 't' and slice[7] == 'i' and slice[8] == 'o' and
+                        slice[9] == 'n' and slice[10] == ':') {
+                        // Found Connection header, check value
+                        var j = i + 12;
+                        while (j < headers.len and (headers[j] == ' ' or headers[j] == '\t')) j += 1;
+                        if (j + 10 <= headers.len) {
+                            const value = headers[j..j+10];
+                            // Check for "keep-alive" (case insensitive)
+                            if (value.len >= 10 and
+                                (value[0] == 'k' or value[0] == 'K') and
+                                (value[1] == 'e' or value[1] == 'E') and
+                                (value[2] == 'e' or value[2] == 'E') and
+                                (value[3] == 'p' or value[3] == 'P') and
+                                (value[4] == '-' or value[4] == '-') and
+                                (value[5] == 'a' or value[5] == 'A') and
+                                (value[6] == 'l' or value[6] == 'L') and
+                                (value[7] == 'i' or value[7] == 'I') and
+                                (value[8] == 'v' or value[8] == 'V') and
+                                (value[9] == 'e' or value[9] == 'E')) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Check if client requested keep-alive connection
+    /// Scans headers for "Connection: keep-alive" (case-insensitive)
+    fn wantsKeepAlive(headers: []const u8) bool {
+        // Look for "Connection:" header
+        const search = "Connection:";
+        var i: usize = 0;
+        while (i + search.len < headers.len) : (i += 1) {
+            if (headers[i] == 'C' or headers[i] == 'c') {
+                if (i + search.len <= headers.len and
+                    std.mem.eql(u8, headers[i..][0..search.len], search)) {
+                    // Found Connection header, check value
+                    var j = i + search.len;
+                    while (j < headers.len and (headers[j] == ' ' or headers[j] == '\t')) j += 1;
+                    const value_start = j;
+                    while (j < headers.len and headers[j] != '\r' and headers[j] != '\n') j += 1;
+                    const value = headers[value_start..j];
+
+                    // Check if value starts with "keep-alive" (case-insensitive)
+                    if (value.len >= 10) {
+                        const lower_first = std.ascii.toLower(value[0]);
+                        if (lower_first == 'k' and
+                            std.mem.eql(u8, value[0..10], "keep-alive")) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     // ============================================================
     // Check Request (Simplified - Always Allow)
     // ============================================================
@@ -444,7 +794,7 @@ fn acceptConnections(self: *Self) void {
         return result;
     }
     
-    fn handleCheckRequest(_: *Self, client_fd: c_int, body: []const u8) bool {
+    fn handleCheckRequest(_: *Self, client_fd: c_int, body: []const u8, agent_id: [32]u8) bool {
         const check = parseCheckRequestFast(body);
 
         // Simple demo policy: deny paths starting with /admin or /secret
@@ -454,9 +804,8 @@ fn acceptConnections(self: *Self) void {
                           std.mem.startsWith(u8, check.path, "/system");
 
         if (is_denied) {
-            // Record the denial for audit
+            // Record the denial for audit (with agent_id from SSL headers)
             const timestamp_us = @as(i64, std.time.timestamp()) * 1_000_000;
-            const agent_id: [32]u8 = .{0} ** 32; // TODO: Extract from JWT/auth
 
             const denial = denial_tracker.DenialRecord.init(
                 timestamp_us,
@@ -466,7 +815,8 @@ fn acceptConnections(self: *Self) void {
                 "demo-deny-policy",
                 .explicit_deny,
             );
-            denial_tracker.getTracker().record(denial);
+            // Record denial (ignore error if tracking disabled)
+            denial_tracker.getTracker().record(denial) catch {};
 
             // Send denial response
             sendJsonResponse(client_fd, .forbidden,
@@ -484,6 +834,15 @@ fn acceptConnections(self: *Self) void {
 
     fn handleDeniedRequests(client_fd: c_int, query: []const u8) !void {
         const tracker = denial_tracker.getTracker();
+
+        // Check if denial tracking is enabled
+        _ = tracker.getRecent(1, null, null) catch |err| {
+            if (err == error.DenialTrackingDisabled) {
+                sendErrorResponse(client_fd, .internal_error, "denial tracking is disabled");
+                return;
+            }
+            return err;
+        };
 
         // Parse query parameters
         var limit: usize = 100;

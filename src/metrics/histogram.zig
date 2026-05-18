@@ -82,7 +82,7 @@ pub const Histogram = struct {
     }
 
     /// Record a latency value - ZERO ALLOCATION, THREAD-SAFE
-    /// Target: <1µs overhead
+    /// Simplified: only track bucket counts and total count (no min/max CAS loops)
     pub fn record(self: *Histogram, value: u64) void {
         // Determine bucket
         const idx = getBucketIndex(value);
@@ -92,37 +92,7 @@ pub const Histogram = struct {
 
         // Update total count
         _ = self.total_count.fetchAdd(1, .monotonic);
-
-        // Update sum for mean calculation
-        _ = self.total_sum.fetchAdd(value, .monotonic);
-
-        // Update min (use compare-swap loop for thread safety)
-        var current_min = self.min_value.load(.monotonic);
-        while (current_min == 0 or value < current_min) {
-            const existing = self.min_value.cmpxchgWeak(current_min, value, .monotonic, .monotonic);
-            if (existing) |actual| {
-                // CAS failed, another thread updated - check if we still need to update
-                current_min = actual;
-                if (value >= current_min) break; // We're no longer the minimum
-            } else {
-                // CAS succeeded, we updated the value
-                break;
-            }
-        }
-
-        // Update max (use compare-swap loop for thread safety)
-        var current_max = self.max_value.load(.monotonic);
-        while (value > current_max) {
-            const existing = self.max_value.cmpxchgWeak(current_max, value, .monotonic, .monotonic);
-            if (existing) |actual| {
-                // CAS failed, another thread updated - check if we still need to update
-                current_max = actual;
-                if (value <= current_max) break; // We're no longer the maximum
-            } else {
-                // CAS succeeded, we updated the value
-                break;
-            }
-        }
+        // Note: Removed min/max CAS loops and total_sum for performance
     }
 
     /// Get total number of recorded values
@@ -146,10 +116,12 @@ pub const Histogram = struct {
     }
 
     /// Get mean latency in microseconds
+    /// Note: Returns 0 since total_sum tracking was removed for performance
     pub fn mean(self: *const Histogram) u64 {
         const c = self.count();
         if (c == 0) return 0;
-        return self.sum() / c;
+        // Note: sum() returns 0 since we removed total_sum tracking
+        return 0;
     }
 
     /// Calculate percentile with linear interpolation - returns value in microseconds

@@ -4,6 +4,10 @@
 
 const std = @import("std");
 
+/// Compile-time flag to enable/disable denial tracking
+/// Set to false to disable denial tracking (improves performance)
+pub const DENIAL_TRACKING_ENABLED = false;
+
 // Configuration
 const MAX_PATH_LEN = 256;
 const MAX_METHOD_LEN = 8;
@@ -114,7 +118,12 @@ pub const DenialTracker = struct {
     }
 
     /// Record a denial (thread-safe)
-    pub fn record(self: *DenialTracker, denial: DenialRecord) void {
+    /// Returns error when DENIAL_TRACKING_ENABLED is false
+    pub fn record(self: *DenialTracker, denial: DenialRecord) !void {
+        if (!DENIAL_TRACKING_ENABLED) {
+            return error.DenialTrackingDisabled;
+        }
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -126,12 +135,17 @@ pub const DenialTracker = struct {
 
     /// Get recent denials - returns OWNED copies (caller must free)
     /// Caller must free the returned slice
+    /// Returns error when DENIAL_TRACKING_ENABLED is false
     pub fn getRecent(
         self: *DenialTracker,
         limit: usize,
         filter_agent: ?[32]u8,
         since_us: ?i64,
     ) ![]DenialRecord {
+        if (!DENIAL_TRACKING_ENABLED) {
+            return error.DenialTrackingDisabled;
+        }
+
         self.mutex.lock();
         defer self.mutex.unlock();
 

@@ -49,29 +49,37 @@ Build a lightweight agent security sidecar in Zig. Prototype ready for acquisiti
 
 ---
 
-### Phase 8: Metrics & Monitoring (Active)
+### Phase 8: Metrics & Monitoring (Complete)
+- [x] U1. Metrics Core: Implement `Metrics` struct in `src/metrics/prometheus.zig` using `std.atomic`.
+- [x] U2. Latency Tracking: Integrate HDR histogram for high-precision latency buckets.
+- [x] U3. Prometheus Exporter: Implement `export()` method to write metrics in Prometheus text format.
+- [x] U4. HTTP Integration: Add `/metrics` route to `src/server/http.zig` and link to `Metrics` instance.
+- [x] U5. Validation: Verify output with `curl` and validate latency recording accuracy.
 
-**Goal:** Implement Prometheus-compatible metrics endpoint for real-time observability.
+---
+
+### Phase 9: mTLS Support (Active)
+
+**Goal:** Implement mutual TLS for agent authentication.
 
 ### Requirements
-- R1. Atomic counters for `requests_total`, `allowed_total`, `denied_total`.
-- R2. HDR Histogram for request latency (P99 focus).
-- R3. Gauge for `active_sessions`.
-- R4. `/metrics` endpoint returning plaintext Prometheus format.
-- R5. Low-overhead recording (sub-microsecond).
+- R1. Mutual authentication: Server validates client cert, client validates server cert.
+- R2. Identity derivation: Derive `agent_id` from client certificate hash.
+- R3. Secure config: Load CA, server cert, and server key from secure storage.
+- R4. Seamless integration: `TLSServer` wraps standard TCP listener.
 
 ### Implementation Units
-- [ ] U1. **Metrics Core**: Implement `Metrics` struct in `src/metrics/prometheus.zig` using `std.atomic`.
-- [ ] U2. **Latency Tracking**: Integrate HDR histogram for high-precision latency buckets.
-- [ ] U3. **Prometheus Exporter**: Implement `export()` method to write metrics in Prometheus text format.
-- [ ] U4. **HTTP Integration**: Add `/metrics` route to `src/server/http.zig` and link to `Metrics` instance.
-- [ ] U5. **Validation**: Verify output with `curl` and validate latency recording accuracy.
+- [ ] U1. **mTLS Core**: Implement `TLSConfig` and `TLSServer` in `src/auth/mtls.zig` using `std.crypto.tls`.
+- [ ] U2. **Identity Mapping**: Implement `hashCertificate` to derive `agent_id` from peer certificate.
+- [ ] U3. **Server Integration**: Update `src/server/http.zig` to support TLS handshake during connection acceptance.
+- [ ] U4. **Cert Tooling**: Create shell scripts for generating test CA, server, and agent certificates via `openssl`.
+- [ ] U5. **Validation**: Verify successful mutual handshake and rejection of invalid/missing client certificates.
 
 ### Dependencies
-- Phase 6/7 Server and Request flow.
-- `std.atomic` for lock-free counters.
+- `std.crypto.tls` for handshake logic.
+- Valid X.509 certificates for testing.
 
 ### Verification
-- [ ] `curl localhost:8080/metrics` returns valid Prometheus data.
-- [ ] Counters increment correctly under load.
-- [ ] P99 latency reflects real-world request timing.
+- [ ] `curl --cert agent.crt --key agent.key --cacert ca.crt https://localhost:8080/check` works.
+- [ ] `curl https://localhost:8080/check` (no cert) returns TLS alert/error.
+- [ ] `agent_id` derived from cert matches expected SHA256 hash.

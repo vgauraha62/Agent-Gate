@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
     main_module.addImport("errors", b.addModule("errors", .{ .root_source_file = b.path("src/errors.zig") }));
     main_module.addImport("auth_middleware", b.addModule("auth_middleware", .{ .root_source_file = b.path("src/server/auth_middleware.zig") }));
 
-    const server = b.addModule("server", .{ .root_source_file = b.path("src/server/http.zig") });
+const server = b.addModule("server", .{ .root_source_file = b.path("src/server/http.zig") });
     server.addImport("auth_middleware", b.addModule("auth_middleware", .{ .root_source_file = b.path("src/server/auth_middleware.zig") }));
     server.addImport("audit", b.addModule("audit", .{ .root_source_file = b.path("src/audit/logger.zig") }));
     main_module.addImport("server", server);

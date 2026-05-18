@@ -13,7 +13,7 @@ pub fn main() !void {
 
     std.debug.print("AgentGate v1.0.0\n", .{});
 
-    // Load configuration
+// Load configuration
     var config = Config.Config.default();
     defer config.deinit();
 
@@ -25,6 +25,20 @@ pub fn main() !void {
         // Use default for testing
         config.auth.jwt_secret = "agent-gate-default-secret-32bytes!";
     }
+
+    // Override TLS mode from environment
+    const tls_mode_env = std.process.getEnvVarOwned(allocator, "AGENTGATE_TLS_MODE") catch null;
+    if (tls_mode_env) |tls_mode| {
+        defer allocator.free(tls_mode);
+        if (std.mem.eql(u8, tls_mode, "external")) {
+            config.tls.mode = .external;
+        } else if (std.mem.eql(u8, tls_mode, "native")) {
+            config.tls.mode = .native;
+        }
+    }
+
+    // Optionally load config from file if provided (env var takes precedence for TLS mode)
+    // Config file loading not implemented - use env vars for TLS mode
 
     // Validate configuration
     config.validate() catch |err| {
@@ -44,6 +58,8 @@ pub fn main() !void {
     var args = std.process.argsWithAllocator(allocator) catch unreachable;
     defer args.deinit();
     _ = args.next(); // skip program name
+
+    var config_path: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--sync")) {
             mode = http.ServerMode.sync_posix;
@@ -55,18 +71,20 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--thread-pool")) {
             use_async_io = false;
             use_thread_pool = true;
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            config_path = args.next();
         }
     }
 
     if (use_async_io) {
         std.debug.print("[Startup] Mode: async (epoll) - NO thread pool (fully async I/O)\n", .{});
-        
+
         // Initialize audit logger
         var audit_logger = audit.AuditLogger.init();
-        
+
         // Define default policies
         const default_policies = &[_]types.Policy{};
-        
+
         // Create async server
         var server = http_async.Server.init(
             allocator,
@@ -77,7 +95,7 @@ pub fn main() !void {
             .async_epoll,
         );
         defer server.deinit();
-        
+
         std.debug.print("[Startup] Starting async HTTP server on port {d}...\n", .{config.server.port});
         try server.run();
     } else {
@@ -100,6 +118,9 @@ pub fn main() !void {
             default_policies,
             config.auth.jwt_secret,
             mode,
+            config.tls.mode,
+            config.tls.require_ssl_headers,
+            config.tls.external_policy,
         );
         defer server.deinit();
 

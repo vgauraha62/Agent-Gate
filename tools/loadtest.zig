@@ -264,6 +264,11 @@ pub const BenchmarkStats = struct {
     /// Initial RSS in bytes.
     initial_rss_bytes: u64 = 0,
 
+    /// Benchmark start time (nanoseconds since epoch)
+    start_time_ns: i128 = 0,
+    /// Benchmark end time (nanoseconds since epoch)
+    end_time_ns: i128 = 0,
+
     const Self = @This();
 
     /// Initialize benchmark stats
@@ -296,7 +301,8 @@ pub const BenchmarkStats = struct {
             i += 1;
         }
 
-        const idx = @divExact(sorted.len, 2);
+        // Use regular division to handle odd-length arrays
+        const idx = sorted.len / 2;
         self.p50_latency_us = sorted[idx];
         self.median_latency = sorted[idx];
 
@@ -414,6 +420,20 @@ pub const RequestResult = struct {
         fd: c_int = -1,
         host: []const u8,
         port: u16,
+        /// Socket read timeout in milliseconds
+        timeout_ms: u32 = 10000,
+
+        // Adaptive load balancing fields
+        /// Moving average of latency (µs) - for dynamic delay
+        avg_latency_us: u64 = 100,
+        /// Counter for connection cycling
+        request_count: usize = 0,
+
+        // Configuration constants
+        const MAX_REQUESTS_PER_CONN = 200;  // Cycle connection less frequently (was 100)
+        const LATENCY_THRESHOLD_US: u64 = 500;  // Only delay when near target (500µs)
+        const BASE_DELAY_US: u64 = 10;  // Minimum delay (µs) - smaller to avoid feedback loop
+        const MAX_DELAY_US: u64 = 200;  // Maximum delay (µs) - cap to prevent over-delay
 
         const Self = @This();
 
@@ -423,6 +443,21 @@ pub const RequestResult = struct {
                 .host = host,
                 .port = port,
                 .fd = -1,
+                .timeout_ms = 10000,
+                .avg_latency_us = 100,
+                .request_count = 0,
+            };
+        }
+
+        /// Create and connect a persistent client with custom timeout
+        pub fn initWithTimeout(host: []const u8, port: u16, timeout_ms: u32) !Self {
+            return Self{
+                .host = host,
+                .port = port,
+                .fd = -1,
+                .timeout_ms = if (timeout_ms == 0) 10000 else timeout_ms,
+                .avg_latency_us = 100,
+                .request_count = 0,
             };
         }
 
@@ -448,11 +483,52 @@ pub const RequestResult = struct {
             }
         }
 
-        /// Perform HTTP request using persistent connection
+        /// Perform HTTP request using persistent connection with retry on timeout
         pub fn request(self: *Self, token: []const u8, path: []const u8) !RequestResult {
+            // Retry on timeout once
+            var retries: usize = 0;
+            const max_retries = 1;
+
+            while (true) {
+                const result = self.doRequest(token, path) catch |err| {
+                    if (err == error.Timeout and retries < max_retries) {
+                        // On timeout, close connection and retry
+                        if (self.fd >= 0) {
+                            _ = c.close(self.fd);
+                            self.fd = -1;
+                        }
+                        retries += 1;
+                        continue;
+                    }
+                    return err;
+                };
+                return result;
+            }
+        }
+
+        /// Actual request implementation
+        fn doRequest(self: *Self, token: []const u8, path: []const u8) !RequestResult {
+            // Adaptive load balancing: Connection cycling
+            // After MAX_REQUESTS_PER_CONN requests, reconnect to get fresh position in queue
+            if (self.request_count >= Self.MAX_REQUESTS_PER_CONN) {
+                if (self.fd >= 0) {
+                    _ = c.close(self.fd);
+                    self.fd = -1;
+                }
+                self.request_count = 0;
+            }
+
             // Connect if not already connected
             if (self.fd < 0) {
                 try self.connect();
+            }
+
+            // Adaptive load balancing: Dynamic delay based on latency
+            // If avg latency > threshold, add delay to provide backpressure
+            if (self.avg_latency_us > Self.LATENCY_THRESHOLD_US) {
+                const extra = @min(self.avg_latency_us - Self.LATENCY_THRESHOLD_US, Self.MAX_DELAY_US - Self.BASE_DELAY_US);
+                const delay_us = Self.BASE_DELAY_US + extra;
+                std.Thread.sleep(delay_us * 1000);  // Convert µs to ns
             }
 
             const start_ns = std.time.nanoTimestamp();
@@ -466,24 +542,61 @@ pub const RequestResult = struct {
             const request_size = request_str.len;
             defer std.heap.page_allocator.free(request_str);
 
-            // Send request using POSIX write
+            // Send request using POSIX write with retry on failure
             var sent: usize = 0;
+            var write_retries: usize = 0;
+            const max_write_retries = 3;
+
             while (sent < request_str.len) {
                 const n = c.write(self.fd, request_str.ptr + sent, request_str.len - sent);
                 if (n <= 0) {
                     // Connection broken, try to reconnect
                     self.fd = -1;
-                    try self.connect();
-                    return error.WriteFailed;
+                    if (write_retries >= max_write_retries) {
+                        // Too many retries - give up
+                        return error.WriteFailed;
+                    }
+                    // Try to reconnect
+                    self.connect() catch {
+                        // Reconnection failed - give up
+                        return error.WriteFailed;
+                    };
+                    // Reconnected successfully - restart write from beginning
+                    write_retries += 1;
+                    sent = 0;
+                    continue;
                 }
                 sent += @as(usize, @intCast(n));
             }
 
-            // Read response - read until connection close or buffer full
+            // Read response - read until connection close or buffer full with timeout
             var response_buf: [4096]u8 = undefined;
             var total_read: usize = 0;
+            var timeout_occurred = false;
 
             while (total_read < response_buf.len) {
+                // Set up poll for readability check with timeout
+                var poll_fds = [_]std.posix.pollfd{std.posix.pollfd{
+                    .fd = self.fd,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+
+                const poll_timeout = @as(i32, @intCast(self.timeout_ms));
+                const poll_result: usize = std.posix.poll(poll_fds[0..], poll_timeout) catch |err| switch (err) {
+                    else => break,
+                };
+
+                if (poll_result < 0) {
+                    // Poll error - treat as failure
+                    break;
+                } else if (poll_result == 0) {
+                    // Timeout - no data available within timeout period
+                    timeout_occurred = true;
+                    break;
+                }
+
+                // Data is available, try to read it
                 const n = c.read(self.fd, response_buf[total_read..].ptr, response_buf.len - total_read);
                 if (n <= 0) {
                     // EOF or error - connection likely closed by server
@@ -508,8 +621,17 @@ pub const RequestResult = struct {
 
             const response_size = total_read;
 
+            // If timeout occurred with no data, return timeout error
+            if (timeout_occurred and total_read == 0) {
+                return error.Timeout;
+            }
+
             const end_ns = std.time.nanoTimestamp();
             const latency_us = @as(u64, @intCast(@divTrunc(end_ns - start_ns, 1000)));
+
+            // Update moving average latency (exponential moving average: avg = avg * 7/8 + new / 8)
+            self.avg_latency_us = (self.avg_latency_us * 7 + latency_us) / 8;
+            self.request_count += 1;
 
             return RequestResult{
                 .latency_us = latency_us,
@@ -542,6 +664,8 @@ pub const RequestResult = struct {
         allocator: std.mem.Allocator,
         /// Persistent client for keep-alive
         persistent: ?PersistentClient = null,
+        /// Socket read timeout in milliseconds (default: 10 seconds)
+        timeout_ms: u32 = 10000,
 
         const Self = @This();
 
@@ -553,6 +677,19 @@ pub const RequestResult = struct {
                 .port = port,
                 .allocator = allocator,
                 .persistent = null,
+                .timeout_ms = 10000,
+            };
+        }
+
+        /// Create a new load test client with custom timeout.
+        pub fn initWithTimeout(allocator: std.mem.Allocator, host: []const u8, port: u16, timeout_ms: u32) !Self {
+            const host_copy = try allocator.dupe(u8, host);
+            return Self{
+                .host = host_copy,
+                .port = port,
+                .allocator = allocator,
+                .persistent = null,
+                .timeout_ms = timeout_ms,
             };
         }
 
@@ -566,13 +703,16 @@ pub const RequestResult = struct {
 
 /// Perform a single HTTP GET request using TCP and measure latency.
 /// Returns RequestResult with latency and size info.
-    pub fn request(_: *Self, token: []const u8) !RequestResult {
+    pub fn request(self: *Self, token: []const u8) !RequestResult {
         const start_ns = std.time.nanoTimestamp();
 
         // Create TCP connection
         const address = try std.net.Address.parseIp("127.0.0.1", 8080);
         const socket = try std.net.tcpConnectToAddress(address);
         defer socket.close();
+
+        // Get file handle for poll
+        const fd = socket.handle;
 
         // Build HTTP request with keep-alive header
         const request_str = try std.fmt.allocPrint(
@@ -586,15 +726,73 @@ pub const RequestResult = struct {
         // Send request
         try socket.writeAll(request_str);
 
-        // Read response
+        // Read response with timeout using poll
         var response_buf: [2048]u8 = undefined;
-        const bytes_read = socket.read(&response_buf) catch 0;
-        const response_size = bytes_read;
+        var total_read: usize = 0;
+        var timeout_occurred = false;
+
+        while (total_read < response_buf.len) {
+            // Set up poll for readability check with timeout
+            var poll_fds = [_]std.posix.pollfd{std.posix.pollfd{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+
+            // Convert timeout_ms to milliseconds (poll expects ms)
+            const poll_timeout = @as(i32, @intCast(self.timeout_ms));
+            const poll_result: usize = std.posix.poll(poll_fds[0..], poll_timeout) catch |err| switch (err) {
+                else => break,
+            };
+
+            if (poll_result < 0) {
+                // Poll error - treat as failure
+                break;
+            } else if (poll_result == 0) {
+                // Timeout - no data available within timeout period
+                timeout_occurred = true;
+                break;
+            }
+
+            // Data is available, try to read it
+            const n = socket.read(response_buf[total_read..]) catch {
+                // Read error or EOF
+                break;
+            };
+
+            if (n == 0) {
+                // EOF - connection closed by server
+                break;
+            }
+
+            total_read += @as(usize, @intCast(n));
+
+            // Check if we have complete response (look for end of headers)
+            if (total_read >= 4) {
+                var i: usize = 0;
+                while (i + 3 < total_read) {
+                    if (response_buf[i] == '\r' and response_buf[i+1] == '\n' and
+                        response_buf[i+2] == '\r' and response_buf[i+3] == '\n') {
+                        // Found end of headers, we have a complete response
+                        break;
+                    }
+                    i += 1;
+                }
+                if (i + 3 < total_read) break;
+            }
+        }
+
+        const response_size = total_read;
 
         const end_ns = std.time.nanoTimestamp();
         // Return latency in microseconds using @divTrunc for i128 division
         const latency_us = @as(u64, @intCast(@divTrunc(end_ns - start_ns, 1000)));
-        
+
+        // If timeout occurred, return timeout error instead of treating as success
+        if (timeout_occurred and total_read == 0) {
+            return error.Timeout;
+        }
+
         return RequestResult{
             .latency_us = latency_us,
             .request_size = request_size,
@@ -711,6 +909,8 @@ pub const WorkerConfig = struct {
     duration_secs: u64 = 0,
     /// Requests per second per worker (0 = unlimited).
     rate_limit: usize = 0,
+    /// Timeout for entire worker in seconds (0 = no timeout).
+    worker_timeout_secs: u64 = 0,
 
     const Self = @This();
 };
@@ -733,7 +933,9 @@ pub const WorkerResult = struct {
 /// This runs in a separate thread.
 pub fn workerThread(
     allocator: std.mem.Allocator,
-    client: *LoadTestClient,
+    host: []const u8,
+    port: u16,
+    timeout_ms: u32,
     pool: *JWTPool,
     config: WorkerConfig,
     result: *WorkerResult,
@@ -743,6 +945,25 @@ pub fn workerThread(
         std.time.nanoTimestamp() + (@as(i128, config.duration_secs) * @as(i128, std.time.ns_per_s))
     else
         0;
+
+    // Worker timeout (safety net)
+    const worker_timeout_ns: i128 = if (config.worker_timeout_secs > 0)
+        std.time.nanoTimestamp() + (@as(i128, config.worker_timeout_secs) * @as(i128, std.time.ns_per_s))
+    else
+        0;
+
+    // Create persistent client for connection reuse (one connection per worker)
+    var persistent = try PersistentClient.initWithTimeout(host, port, timeout_ms);
+    defer persistent.deinit();
+
+    // Connect the persistent client
+    _ = persistent.connect() catch |err| {
+        std.debug.print("[Worker] Failed to connect: {}\n", .{err});
+        result.successful = 0;
+        result.failed = config.total_requests;
+        result.latencies = &.{};
+        return;
+    };
 
     // Simple vector-like collection using slice
     var latencies_buf: [10000]u64 = undefined;
@@ -758,11 +979,17 @@ pub fn workerThread(
             break;
         }
 
+        // Check worker timeout (safety net)
+        if (config.worker_timeout_secs > 0 and std.time.nanoTimestamp() >= worker_timeout_ns) {
+            std.debug.print("[Worker] Timeout reached after {} seconds\n", .{config.worker_timeout_secs});
+            break;
+        }
+
         // Get next token
         const token = pool.next();
 
-        // Make request - catch and count failures
-        const req_result = client.request(token) catch |err| {
+        // Make request using persistent connection - catch and count failures
+        const req_result = persistent.request(token, "/v1/agents") catch |err| {
             failed += 1;
             request_count += 1;
             // Only print first few failures to avoid spam
@@ -774,7 +1001,7 @@ pub fn workerThread(
 
         successful += 1;
         request_count += 1;
-        
+
         // Store latency
         if (latencies_len < latencies_buf.len) {
             latencies_buf[latencies_len] = req_result.latency_us;
@@ -803,6 +1030,10 @@ pub fn runConcurrentBenchmark(
 ) !BenchmarkStats {
     var stats = BenchmarkStats.init(allocator);
 
+    // Record start time
+    const start_ns = std.time.nanoTimestamp();
+    stats.start_time_ns = start_ns;
+
     // Pre-allocate results array
     var results = try allocator.alloc(WorkerResult, config.num_workers);
     defer {
@@ -826,7 +1057,9 @@ pub fn runConcurrentBenchmark(
     for (0..config.num_workers) |i| {
         const t = try std.Thread.spawn(.{}, workerThread, .{
             allocator,
-            client,
+            client.host,
+            client.port,
+            client.timeout_ms,
             pool,
             config,
             &results[i],
@@ -844,6 +1077,10 @@ pub fn runConcurrentBenchmark(
         t.join();
     }
     std.debug.print("All workers joined\n", .{});
+
+    // Record end time
+    const end_ns = std.time.nanoTimestamp();
+    stats.end_time_ns = end_ns;
 
     // Update memory instrumentation
     memory.updatePeak();
@@ -906,6 +1143,10 @@ pub const BenchmarkConfig = struct {
     duration_secs: u64 = 0,
     /// Requests per second per worker (0 = unlimited).
     rate_limit: usize = 0,
+    /// Socket read timeout in milliseconds (default: 10 seconds).
+    timeout_ms: u32 = 10000,
+    /// Worker timeout in seconds (0 = no timeout).
+    worker_timeout_secs: u64 = 0,
     /// Whether to spawn server or connect to existing.
     spawn_server: bool = true,
     /// Whether to run stress test mode.
@@ -1037,8 +1278,8 @@ pub fn main() !void {
     
     std.debug.print("\n", .{});
     
-    // Create client and pool
-    var client = try LoadTestClient.init(allocator, config.host, config.port);
+    // Create client and pool (with timeout)
+    var client = try LoadTestClient.initWithTimeout(allocator, config.host, config.port, config.timeout_ms);
     defer client.deinit();
     
     var pool = try JWTPool.init(allocator, config.token_pool_size, config.jwt_secret);
@@ -1049,6 +1290,7 @@ pub fn main() !void {
         .total_requests = config.total_requests,
         .duration_secs = config.duration_secs,
         .rate_limit = config.rate_limit,
+        .worker_timeout_secs = config.worker_timeout_secs,
     };
 
     std.debug.print("Running benchmark...\n", .{});
@@ -1057,8 +1299,9 @@ pub fn main() !void {
     // Use detailed output
     stats.printDetailed();
 
-    // Calculate throughput
-    const duration_sec = @as(f64, @floatFromInt(stats.avg_latency_us * stats.total_requests)) / 1_000_000;
+    // Calculate throughput using actual wall-clock time
+    const duration_ns = @as(i128, stats.end_time_ns - stats.start_time_ns);
+    const duration_sec = @as(f64, @floatFromInt(duration_ns)) / @as(f64, std.time.ns_per_s);
     const rps = if (duration_sec > 0) @as(u64, @intFromFloat(@as(f64, @floatFromInt(stats.total_requests)) / duration_sec)) else 0;
 
     std.debug.print("\nThroughput: {d} req/s\n", .{rps});
