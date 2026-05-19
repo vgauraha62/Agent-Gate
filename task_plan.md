@@ -58,28 +58,46 @@ Build a lightweight agent security sidecar in Zig. Prototype ready for acquisiti
 
 ---
 
-### Phase 9: mTLS Support (Active)
+### Phase 9: mTLS Support (Complete)
 
 **Goal:** Implement mutual TLS for agent authentication.
 
 ### Requirements
-- R1. Mutual authentication: Server validates client cert, client validates server cert.
-- R2. Identity derivation: Derive `agent_id` from client certificate hash.
-- R3. Secure config: Load CA, server cert, and server key from secure storage.
-- R4. Seamless integration: `TLSServer` wraps standard TCP listener.
+- [x] R1. Mutual authentication: Server validates client cert, client validates server cert.
+- [x] R2. Identity derivation: Derive `agent_id` from client certificate hash.
+- [x] R3. Secure config: Load CA, server cert, and server key from secure storage.
+- [x] R4. Seamless integration: `TLSServer` wraps standard TCP listener.
 
 ### Implementation Units
-- [ ] U1. **mTLS Core**: Implement `TLSConfig` and `TLSServer` in `src/auth/mtls.zig` using `std.crypto.tls`.
-- [ ] U2. **Identity Mapping**: Implement `hashCertificate` to derive `agent_id` from peer certificate.
-- [ ] U3. **Server Integration**: Update `src/server/http.zig` to support TLS handshake during connection acceptance.
-- [ ] U4. **Cert Tooling**: Create shell scripts for generating test CA, server, and agent certificates via `openssl`.
-- [ ] U5. **Validation**: Verify successful mutual handshake and rejection of invalid/missing client certificates.
+- [x] U1. **mTLS Core**: Implement `TLSConfig` and `TLSServer` in `src/auth/mtls.zig` using `std.crypto.tls`.
+- [x] U2. **Identity Mapping**: Implement `hashCertificate` to derive `agent_id` from peer certificate.
+- [x] U3. **Server Integration**: Update `src/server/http.zig` to support TLS handshake during connection acceptance.
+- [x] U4. **Cert Tooling**: Create shell scripts for generating test CA, server, and agent certificates via `openssl`.
+- [x] U5. **Validation**: Verify successful mutual handshake and rejection of invalid/missing client certificates.
 
 ### Dependencies
 - `std.crypto.tls` for handshake logic.
 - Valid X.509 certificates for testing.
 
 ### Verification
-- [ ] `curl --cert agent.crt --key agent.key --cacert ca.crt https://localhost:8080/check` works.
-- [ ] `curl https://localhost:8080/check` (no cert) returns TLS alert/error.
-- [ ] `agent_id` derived from cert matches expected SHA256 hash.
+- [x] `curl --cert agent.crt --key agent.key --cacert ca.crt https://localhost:8080/check` works.
+- [x] `curl https://localhost:8080/check` (no cert) returns TLS alert/error.
+- [x] `agent_id` derived from cert matches expected SHA256 hash.
+
+---
+
+### Phase 10: Configuration System (Active)
+
+**Goal:** Implement flexible config with JSON file and env var support.
+
+### Implementation Units
+- [ ] U1. **Config Schema**: Define `Config` and sub-structs in `src/config.zig`.
+- [ ] U2. **JSON Loading**: Implement `Config.load()` using `std.json`.
+- [ ] U3. **Env Overrides**: Implement `fromEnv()` using `@typeInfo` reflection.
+- [ ] U4. **Main Integration**: Wire config into `src/main.zig` startup sequence.
+- [ ] U5. **Validation**: Create `tests/config_test.zig` to verify hierarchy.
+
+### Verification
+- [ ] `zig build test` passes for all config scenarios.
+- [ ] Server respects `AGENTGATE_PORT` env var override.
+- [ ] Valid JSON config file is parsed correctly.

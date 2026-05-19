@@ -39,3 +39,6 @@ graphify-out/
 
 # Zig global cache (cross-project)
 # ~/.cache/zig/
+
+# Local config with secrets (never commit)
+config.json

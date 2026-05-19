@@ -13,53 +13,16 @@ pub fn main() !void {
 
     std.debug.print("AgentGate v1.0.0\n", .{});
 
-// Load configuration
-    var config = Config.Config.default();
-    defer config.deinit();
-
-    // Override with environment or defaults
-    if (std.process.getEnvVarOwned(allocator, "JWT_SECRET")) |jwt_secret| {
-        defer allocator.free(jwt_secret);
-        config.auth.jwt_secret = jwt_secret;
-    } else |_| {
-        // Use default for testing
-        config.auth.jwt_secret = "agent-gate-default-secret-32bytes!";
-    }
-
-    // Override TLS mode from environment
-    const tls_mode_env = std.process.getEnvVarOwned(allocator, "AGENTGATE_TLS_MODE") catch null;
-    if (tls_mode_env) |tls_mode| {
-        defer allocator.free(tls_mode);
-        if (std.mem.eql(u8, tls_mode, "external")) {
-            config.tls.mode = .external;
-        } else if (std.mem.eql(u8, tls_mode, "native")) {
-            config.tls.mode = .native;
-        }
-    }
-
-    // Optionally load config from file if provided (env var takes precedence for TLS mode)
-    // Config file loading not implemented - use env vars for TLS mode
-
-    // Validate configuration
-    config.validate() catch |err| {
-        std.debug.print("[Startup] Config validation failed: {}\n", .{err});
-        return err;
-    };
-
-    // Initialize denial tracker for request visibility
-    try denial_tracker.initGlobal(allocator);
-    defer denial_tracker.deinitGlobal();
-
+    // Parse command line arguments first
     var mode = http.ServerMode.async_epoll;
     var use_async_io = false;
     var use_thread_pool = true;
+    var config_path: ?[]const u8 = null;
 
-    // Parse command line arguments
     var args = std.process.argsWithAllocator(allocator) catch unreachable;
     defer args.deinit();
     _ = args.next(); // skip program name
 
-    var config_path: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--sync")) {
             mode = http.ServerMode.sync_posix;
@@ -76,23 +39,51 @@ pub fn main() !void {
         }
     }
 
+    // Load configuration - priority: Env > File > Defaults
+    var config: Config.Config = undefined;
+    if (config_path) |path| {
+        std.debug.print("[Startup] Loading configuration from {s}\n", .{path});
+        config = try Config.Config.load(path, allocator);
+    } else {
+        // Use defaults + env overrides
+        config = Config.Config.default();
+        Config.applyOverrides(&config, allocator);
+    }
+    defer config.deinit();
+
+    // Validate configuration
+    config.validate() catch |err| {
+        std.debug.print("[Startup] Config validation failed: {}\n", .{err});
+        return err;
+    };
+
+    // Log configuration summary
+    std.debug.print("[Startup] Configuration:\n", .{});
+    std.debug.print("  Server: {s}:{d}\n", .{ config.server.host, config.server.port });
+    std.debug.print("  Workers: {d}\n", .{config.server.workers});
+    std.debug.print("  TLS: {s}\n", .{ @tagName(config.tls.mode) });
+    std.debug.print("  Request timeout: {d}ms\n", .{config.request.request_timeout_ms});
+    std.debug.print("  Auth timeout: {d}ms\n", .{config.auth.auth_timeout_ms});
+
+    // Initialize denial tracker for request visibility
+    try denial_tracker.initGlobal(allocator);
+    defer denial_tracker.deinitGlobal();
+
     if (use_async_io) {
         std.debug.print("[Startup] Mode: async (epoll) - NO thread pool (fully async I/O)\n", .{});
 
-        // Initialize audit logger
-        var audit_logger = audit.AuditLogger.init();
+        // Initialize audit logger with config
+        var audit_logger = audit.AuditLogger.init(&config.audit);
 
         // Define default policies
         const default_policies = &[_]types.Policy{};
 
-        // Create async server
+        // Create async server with config
         var server = http_async.Server.init(
             allocator,
-            config.server.port,
+            &config,
             &audit_logger,
             default_policies,
-            config.auth.jwt_secret,
-            .async_epoll,
         );
         defer server.deinit();
 
@@ -104,23 +95,18 @@ pub fn main() !void {
         });
         std.debug.print("[Startup] Starting HTTP server on port {d}...\n", .{config.server.port});
 
-        // Initialize audit logger
-        var audit_logger = audit.AuditLogger.init();
+        // Initialize audit logger with config
+        var audit_logger = audit.AuditLogger.init(&config.audit);
 
         // Define default policies (empty for benchmark)
         const default_policies = &[_]types.Policy{};
 
-        // Create server with simplified API (no auth middleware)
+        // Create server with config object
         var server = http.Server.init(
             allocator,
-            config.server.port,
+            &config,
             &audit_logger,
             default_policies,
-            config.auth.jwt_secret,
-            mode,
-            config.tls.mode,
-            config.tls.require_ssl_headers,
-            config.tls.external_policy,
         );
         defer server.deinit();
 

@@ -1,0 +1,80 @@
+---
+title: feat: Configuration System
+type: feat
+status: active
+date: 2026-05-19
+origin: PRD.md
+---
+
+# Configuration System Implementation Plan
+
+## Overview
+Implement a flexible configuration system for AgentGate that supports loading from a JSON file and overriding values via environment variables.
+
+## Requirements Trace
+- R1. **File-based Config**: Load server, auth, policy, and audit settings from a JSON file.
+- R2. **Env Var Overrides**: Allow any config value to be overridden by environment variables (e.g., `AGENTGATE_PORT`).
+- R3. **Default Values**: Provide sensible defaults for all configuration parameters.
+- R4. **Type Safety**: Ensure configuration values are correctly typed (e.g., ports as integers, flags as booleans).
+
+## Scope Boundaries
+- **Included**: JSON parsing, environment variable mapping, integration into `main.zig`.
+- **Non-goals**: Support for YAML/TOML, dynamic configuration reloading without restart (SIGHUP), encrypted config files.
+
+## Key Technical Decisions
+- **Structure**: Use a nested struct hierarchy (`Config` -> `ServerConfig`, `AuthConfig`, etc.) to maintain organization.
+- **Env Mapping**: Use compile-time reflection (`@typeInfo`) to automatically map struct fields to environment variables, reducing boilerplate.
+- **Priority**: Environment variables take precedence over file settings, which take precedence over defaults.
+
+## Implementation Units
+
+### U1. Config Schema Definition
+**Goal**: Define the configuration data structures.
+**Files**: `src/config.zig`
+**Approach**:
+- Define `ServerConfig`, `AuthConfig`, `PolicyConfig`, and `AuditConfig` structs.
+- Define the root `Config` struct containing the above.
+- Provide a `default()` function for each struct to establish baseline settings.
+
+### U2. JSON Loading Logic
+**Goal**: Implement functionality to read and parse the JSON configuration file.
+**Files**: `src/config.zig`
+**Approach**:
+- Implement `Config.load(path: []const u8, allocator: std.mem.Allocator) !Config`.
+- Use `std.fs.cwd().readFileAlloc` to read the file.
+- Use `std.json.parseFromSlice` to deserialize into the `Config` struct.
+
+### U3. Environment Variable Overrides
+**Goal**: Implement a mechanism to override file configuration with environment variables.
+**Files**: `src/config.zig`
+**Approach**:
+- Implement a generic `fromEnv(T: type, allocator: std.mem.Allocator) T` function.
+- Use `@typeInfo(T)` to iterate over fields.
+- Construct env var names as `AGENTGATE_` + uppercase field name.
+- Use `std.process.getEnvVarOwned` to retrieve values.
+- Implement a `parseField` helper to convert strings to the target field type (int, bool, etc.).
+
+### U4. Main Entry Point Integration
+**Goal**: Wire the config system into the application startup sequence.
+**Files**: `src/main.zig`
+**Approach**:
+- Update `main()` to:
+    1. Determine config path (from flag or default).
+    2. Load file config.
+    3. Apply environment overrides.
+    4. Pass the final `Config` object to component initializers.
+
+### U5. Validation & Testing
+**Goal**: Verify the configuration hierarchy and correctness.
+**Files**: `tests/config_test.zig`
+**Approach**:
+- Test loading a valid JSON file.
+- Test that environment variables successfully override file values.
+- Test that defaults are used when both file and env are missing.
+- Test error handling for malformed JSON.
+
+## Verification Plan
+- [ ] `zig build test` passes for all config scenarios.
+- [ ] Start server with `AGENTGATE_PORT=9000` and verify it listens on port 9000.
+- [ ] Verify `SIGHUP` is NOT implemented (out of scope).
+- [ ] Check binary logs to ensure config is loaded correctly at startup.

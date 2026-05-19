@@ -19,6 +19,8 @@ const fullHash = types.fullHash;
 const crypto_audit = @import("crypto.zig");
 const AuditSigner = crypto_audit.AuditSigner;
 
+const config = @import("../config.zig");
+
 // Backward compatibility alias
 pub const AuditLogger = AuditLog;
 
@@ -47,7 +49,11 @@ pub const AuditLog = struct {
     const ZERO_HASH_32: [32]u8 = [_]u8{0} ** 32;
 
     /// Initialize empty audit log (zero allocation)
-    pub fn init() AuditLog {
+    /// Accepts optional audit config for buffer size and timeout settings.
+    /// Note: Internal buffer size is compile-time constant (BUFFER_SIZE = 1024).
+    /// The config's buffer_size is used for validation/reference only.
+    pub fn init(cfg: *const config.AuditConfig) AuditLog {
+        _ = cfg; // Reserved for future use with dynamic buffer sizes
         return AuditLog{
             .buffer = undefined,
             .write_index = 0,

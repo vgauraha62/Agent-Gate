@@ -8,6 +8,7 @@ const posix = std.posix;
 const types = @import("../policy/types.zig");
 const audit = @import("../audit/logger.zig");
 const prometheus = @import("../metrics/prometheus.zig");
+const config = @import("../config.zig");
 
 // ============================================================
 // Constants
@@ -72,19 +73,17 @@ pub const Server = struct {
     
     pub fn init(
         allocator: std.mem.Allocator,
-        port: u16,
+        cfg: *const config.Config,
         audit_logger: *audit.AuditLogger,
         policies: []const types.Policy,
-        secret_key: []const u8,
-        mode: ServerMode,
     ) Self {
         return Self{
             .allocator = allocator,
-            .port = port,
+            .port = cfg.server.port,
             .audit_logger = audit_logger,
             .policies = policies,
-            .secret_key = secret_key,
-            .mode = mode,
+            .secret_key = cfg.auth.jwt_secret,
+            .mode = .async_epoll,
         };
     }
     

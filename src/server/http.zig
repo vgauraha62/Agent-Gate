@@ -306,25 +306,20 @@ pub const Server = struct {
     
     pub fn init(
         allocator: std.mem.Allocator,
-        port: u16,
+        cfg: *const config.Config,
         audit_logger: *audit.AuditLogger,
         policies: []const types.Policy,
-        secret_key: []const u8,
-        mode: ServerMode,
-        tls_mode: config.TLSMode,
-        require_ssl_headers: bool,
-        external_policy: config.ExternalPolicy,
     ) Self {
         return Self{
             .allocator = allocator,
-            .port = port,
+            .port = cfg.server.port,
             .audit_logger = audit_logger,
             .policies = policies,
-            .secret_key = secret_key,
-            .mode = mode,
-            .tls_mode = tls_mode,
-            .require_ssl_headers = require_ssl_headers,
-            .external_policy = external_policy,
+            .secret_key = cfg.auth.jwt_secret,
+            .mode = .async_epoll,
+            .tls_mode = cfg.tls.mode,
+            .require_ssl_headers = cfg.tls.require_ssl_headers,
+            .external_policy = cfg.tls.external_policy,
         };
     }
     
