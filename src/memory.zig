@@ -86,14 +86,18 @@ pub const SecurityArena = struct {
 
     fn allocFn(ptr: *anyopaque, len: usize, ptr_align: std.mem.Alignment, _: usize) ?[*]u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        _ = ptr_align; // TODO: implement proper alignment handling
+        // Convert Alignment enum to actual byte alignment (1 << byte_shift)
+        const alignment: usize = @as(usize, 1) << @intFromEnum(ptr_align);
 
-        if (self.index + len > self.buffer.len) {
+        // Align the current index to the required alignment
+        const aligned_index = std.mem.alignForward(usize, self.index, alignment);
+
+        if (aligned_index + len > self.buffer.len) {
             return null;
         }
 
-        const start = self.index;
-        self.index += len;
+        const start = aligned_index;
+        self.index = aligned_index + len;
         return self.buffer.ptr + start;
     }
 

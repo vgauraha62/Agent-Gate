@@ -43,10 +43,11 @@ This guide covers setting up mTLS (mutual TLS) for production deployments of Age
 
 ## Identity Derivation
 
-AgentGate derives the `agent_id` from the client certificate using:
+AgentGate derives the `agent_id` from the client certificate using **XxHash64 × 4** (non-cryptographic, fast):
 
 ```
-agent_id = SHA256(DER-encoded client certificate)
+agent_id = XxHash64(cert_der, seed=0) || XxHash64(cert_der, seed=1) ||
+           XxHash64(cert_der, seed=2) || XxHash64(cert_der, seed=3)
 ```
 
 This produces a deterministic 32-byte identifier that matches the `Agent` struct's `id: [32]u8` requirement.

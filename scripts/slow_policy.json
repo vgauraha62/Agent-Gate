@@ -1,0 +1,6 @@
+{
+  "version": "1",
+  "policies": [
+    { "id": "slow-deny", "effect": "deny", "match": { "path": "*", "slow_match": 100 } }
+  ]
+}

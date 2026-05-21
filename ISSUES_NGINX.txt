@@ -1,0 +1,13 @@
+Known Issues Found During Analysis
+#	Issue	Severity	Fix
+1	PRODUCTION_MTLS.md says "SHA256" for agent_id, but code uses XxHash64	Low (docs mismatch)	Update docs to reflect actual implementation
+2	scripts/test_mtls.sh generates its own certs (not using project certs) — this is fine for testing	Info only	No fix needed
+3	nginx $ssl_client_cert with newlines — PEM certs contain \n characters. nginx may fold them or URL-decode. The extractHeaderValue function handles folded headers but needs verification.	Medium	Confirm with test
+4	docs/mtls-nginx.conf uses /etc/nginx/certs/ path — won't work out of box without copying certs	Low	Document the path difference or provide a setup step
+
+
+----------------------
+
+Risks
+- Nginx config validation may fail if nginx isn't installed or cert paths are wrong
+- The nginx $ssl_client_cert multi-line folding behavior may cause header parsing to fail — verified by test script

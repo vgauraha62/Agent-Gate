@@ -476,6 +476,9 @@ pub const PolicyConfig = struct {
     policy_timeout_ms: u32 = 50,
     /// Maximum policies to evaluate per request.
     max_policies: usize = 1000,
+    /// Path to policy JSON file (relative to working directory).
+    /// If null, defaults to "policies/default.json".
+    policy_file: ?[]const u8 = null,
 };
 
 /// Audit configuration.
@@ -635,7 +638,8 @@ pub const Config = struct {
             applyOverrides(&config, allocator);
             return config;
         };
-        defer allocator.free(file);
+        // NOTE: Do NOT free file here - config struct holds slices pointing to it.
+        // Caller must manage allocator lifecycle (e.g., arena deinit at program end).
 
         // Parse JSON from file
         var parsed = try std.json.parseFromSlice(Self, allocator, file, .{

@@ -35,7 +35,7 @@ pub fn parse(json_bytes: []const u8, arena: *SecurityArena) !PolicyFile {
         return error.InvalidPolicyFile;
 
     // Allocate policies slice
-    const policies = try arena.alloc(types.Policy, policies_array.items.len);
+    const policies = try arena.allocator().alloc(types.Policy, policies_array.items.len);
 
     // Parse each policy
     for (policies_array.items, 0..) |policy_value, i| {
@@ -77,9 +77,10 @@ fn parsePolicy(value: std.json.Value, arena: *SecurityArena) !types.Policy {
     if (match_obj.get("agent_id")) |_| condition_count += 1;
     if (match_obj.get("path")) |_| condition_count += 1;
     if (match_obj.get("method")) |_| condition_count += 1;
+    if (match_obj.get("slow_match")) |_| condition_count += 1;
 
     // Allocate conditions slice
-    const conditions = try arena.alloc(types.Condition, condition_count);
+    const conditions = try arena.allocator().alloc(types.Condition, condition_count);
     var condition_idx: usize = 0;
 
     // Parse agent_id condition (optional)
@@ -107,6 +108,16 @@ fn parsePolicy(value: std.json.Value, arena: *SecurityArena) !types.Policy {
         condition_idx += 1;
     }
 
+    // Parse slow_match condition (optional, number = milliseconds)
+    if (match_obj.get("slow_match")) |v| {
+        const ms = switch (v) {
+            .integer => |n| @as(u64, @intCast(@as(i64, n))),
+            else => return error.InvalidCondition,
+        };
+        conditions[condition_idx] = types.Condition{ .slow_match = ms };
+        condition_idx += 1;
+    }
+
     return types.Policy{
         .id = id,
         .effect = effect,
@@ -116,7 +127,7 @@ fn parsePolicy(value: std.json.Value, arena: *SecurityArena) !types.Policy {
 
 /// Parse method array from JSON value.
 fn parseMethodArray(array: std.json.Array, arena: *SecurityArena) !types.Condition {
-    const methods = try arena.alloc(types.Method, array.items.len);
+    const methods = try arena.allocator().alloc(types.Method, array.items.len);
 
     for (array.items, 0..) |method_value, i| {
         const method_str = if (method_value == .string) method_value.string else return error.InvalidMethod;
@@ -185,6 +196,7 @@ fn parsePolicyComptime(value: std.json.Value) types.Policy {
     if (match_obj.get("agent_id") != null) condition_count += 1;
     if (match_obj.get("path") != null) condition_count += 1;
     if (match_obj.get("method") != null) condition_count += 1;
+    if (match_obj.get("slow_match") != null) condition_count += 1;
 
     var conditions: [4]types.Condition = undefined;
     var condition_idx: usize = 0;
@@ -208,6 +220,15 @@ fn parsePolicyComptime(value: std.json.Value) types.Policy {
             else => @compileError("Invalid condition: method must be string or array"),
         };
         conditions[condition_idx] = method_condition;
+        condition_idx += 1;
+    }
+
+    if (match_obj.get("slow_match")) |v| {
+        const ms = switch (v) {
+            .integer => |n| @as(u64, @intCast(@as(i64, n))),
+            else => @compileError("Invalid condition: slow_match must be a number"),
+        };
+        conditions[condition_idx] = types.Condition{ .slow_match = ms };
         condition_idx += 1;
     }
 
@@ -915,4 +936,65 @@ test "parse comptime method array" {
     const result = comptime parseComptime(json);
     try std.testing.expectEqual(@as(usize, 1), result.policies.len);
     try std.testing.expectEqual(@as(usize, 1), result.policies[0].conditions.len);
+}
+
+// ============================================================================
+// slow_match parsing tests
+// ============================================================================
+
+test "parse policy with slow_match condition" {
+    const gpa = std.testing.allocator;
+    var arena = try SecurityArena.init(gpa, 4096);
+    defer arena.deinit();
+
+    const json =
+        \\{"version": "1", "policies": [
+        \\  {"id": "slow-deny", "effect": "deny", "match": {"path": "*", "slow_match": 100}}
+        \\]}
+    ;
+
+    const result = try parse(json, &arena);
+    try std.testing.expectEqual(@as(usize, 1), result.policies.len);
+    try std.testing.expectEqual(@as(usize, 2), result.policies[0].conditions.len);
+    try std.testing.expectEqual(types.Condition{ .path = "*" }, result.policies[0].conditions[0]);
+    try std.testing.expectEqual(types.Condition{ .slow_match = 100 }, result.policies[0].conditions[1]);
+}
+
+test "parse policy with slow_match only" {
+    const gpa = std.testing.allocator;
+    var arena = try SecurityArena.init(gpa, 4096);
+    defer arena.deinit();
+
+    const json =
+        \\{"version": "1", "policies": [
+        \\  {"id": "slow-only", "effect": "allow", "match": {"slow_match": 50}}
+        \\]}
+    ;
+
+    const result = try parse(json, &arena);
+    try std.testing.expectEqual(@as(usize, 1), result.policies.len);
+    try std.testing.expectEqual(@as(usize, 1), result.policies[0].conditions.len);
+    try std.testing.expectEqual(types.Condition{ .slow_match = 50 }, result.policies[0].conditions[0]);
+}
+
+test "parse slow_match as string should fail" {
+    const gpa = std.testing.allocator;
+    var arena = try SecurityArena.init(gpa, 4096);
+    defer arena.deinit();
+
+    const json =
+        \\{"version": "1", "policies": [{"id": "test", "effect": "allow", "match": {"slow_match": "100"}}]}
+    ;
+
+    try std.testing.expectError(error.InvalidCondition, parse(json, &arena));
+}
+
+test "parse comptime policy with slow_match" {
+    const json =
+        \\{"version": "1", "policies": [{"id": "slow-test", "effect": "deny", "match": {"path": "*", "slow_match": 100}}]}
+    ;
+
+    const result = comptime parseComptime(json);
+    try std.testing.expectEqual(@as(usize, 1), result.policies.len);
+    try std.testing.expectEqual(@as(usize, 2), result.policies[0].conditions.len);
 }

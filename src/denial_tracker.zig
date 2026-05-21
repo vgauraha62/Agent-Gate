@@ -6,7 +6,7 @@ const std = @import("std");
 
 /// Compile-time flag to enable/disable denial tracking
 /// Set to false to disable denial tracking (improves performance)
-pub const DENIAL_TRACKING_ENABLED = false;
+pub const DENIAL_TRACKING_ENABLED = true;
 
 // Configuration
 const MAX_PATH_LEN = 256;

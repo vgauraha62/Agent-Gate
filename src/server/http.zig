@@ -51,6 +51,7 @@ pub const HttpStatus = enum(u16) {
     unauthorized = 401,
     forbidden = 403,
     not_found = 404,
+    gateway_timeout = 504,
     internal_error = 500,
 };
 
@@ -272,7 +273,8 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     port: u16,
     audit_logger: *audit.AuditLogger,
-    policies: []const types.Policy,
+    policy_set: types.PolicySet,
+    policy_timeout_ms: u32,
     secret_key: []const u8,
     mode: ServerMode = .async_epoll,
 
@@ -308,13 +310,14 @@ pub const Server = struct {
         allocator: std.mem.Allocator,
         cfg: *const config.Config,
         audit_logger: *audit.AuditLogger,
-        policies: []const types.Policy,
+        policy_set: types.PolicySet,
     ) Self {
         return Self{
             .allocator = allocator,
             .port = cfg.server.port,
             .audit_logger = audit_logger,
-            .policies = policies,
+            .policy_set = policy_set,
+            .policy_timeout_ms = cfg.policy.policy_timeout_ms,
             .secret_key = cfg.auth.jwt_secret,
             .mode = .async_epoll,
             .tls_mode = cfg.tls.mode,
@@ -789,37 +792,59 @@ fn acceptConnections(self: *Self) void {
         return result;
     }
     
-    fn handleCheckRequest(_: *Self, client_fd: c_int, body: []const u8, agent_id: [32]u8) bool {
+    fn handleCheckRequest(self: *Self, client_fd: c_int, body: []const u8, agent_id: [32]u8) bool {
         const check = parseCheckRequestFast(body);
 
-        // Simple demo policy: deny paths starting with /admin or /secret
-        // In production, this would use the full policy engine
-        const is_denied = std.mem.startsWith(u8, check.path, "/admin") or
-                          std.mem.startsWith(u8, check.path, "/secret") or
-                          std.mem.startsWith(u8, check.path, "/system");
+        // Build request context for policy evaluation
+        const method = types.Method.parse(check.method) catch .GET;
+        const ctx = types.RequestContext.init(
+            std.fmt.bytesToHex(agent_id, .lower)[0..],
+            check.path,
+            method,
+        );
 
-        if (is_denied) {
-            // Record the denial for audit (with agent_id from SSL headers)
-            const timestamp_us = @as(i64, std.time.timestamp()) * 1_000_000;
-
-            const denial = denial_tracker.DenialRecord.init(
-                timestamp_us,
-                agent_id,
-                check.path,
-                check.method,
-                "demo-deny-policy",
-                .explicit_deny,
-            );
-            // Record denial (ignore error if tracking disabled)
-            denial_tracker.getTracker().record(denial) catch {};
-
-            // Send denial response
+        // Evaluate with timeout using real policy engine
+        const decision = self.policy_set.evaluateWithTimeout(&ctx, self.policy_timeout_ms) catch |err| {
+            if (err == error.PolicyTimeout) {
+                // Return 504 Gateway Timeout
+                sendJsonResponse(client_fd, .gateway_timeout,
+                    "{\"allowed\":false,\"reason\":\"policy timeout\",\"policy_id\":\"timeout\"}");
+                return false;
+            }
+            // Other errors - treat as deny
             sendJsonResponse(client_fd, .forbidden,
-                "{\"allowed\":false,\"reason\":\"policy denied\",\"policy_id\":\"demo-deny-policy\"}");
+                "{\"allowed\":false,\"reason\":\"policy evaluation error\",\"policy_id\":\"error\"}");
             return false;
-        } else {
-            sendJsonResponse(client_fd, .ok, "{\"allowed\":true}");
-            return true;
+        };
+
+        // Check decision effect
+        switch (decision.effect) {
+            .allow => {
+                sendJsonResponse(client_fd, .ok, "{\"allowed\":true}");
+                return true;
+            },
+            .deny => {
+                // Record the denial for audit
+                const timestamp_us = @as(i64, std.time.timestamp()) * 1_000_000;
+                const denial = denial_tracker.DenialRecord.init(
+                    timestamp_us,
+                    agent_id,
+                    check.path,
+                    check.method,
+                    decision.policy_id,
+                    .explicit_deny,
+                );
+                denial_tracker.getTracker().record(denial) catch {};
+
+                // Build denial response with dynamic policy_id
+                var response_buf: [512]u8 = undefined;
+                const response = std.fmt.bufPrint(&response_buf,
+                    "{{\"allowed\":false,\"reason\":\"policy denied\",\"policy_id\":\"{s}\"}}",
+                    .{decision.policy_id}) catch "{\"allowed\":false,\"reason\":\"policy denied\"}";
+
+                sendJsonResponse(client_fd, .forbidden, response);
+                return false;
+            },
         }
     }
 
@@ -1006,6 +1031,7 @@ pub fn statusText(status: HttpStatus) []const u8 {
         .unauthorized => "Unauthorized",
         .forbidden => "Forbidden",
         .not_found => "Not Found",
+        .gateway_timeout => "Gateway Timeout",
         .internal_error => "Internal Server Error",
     };
 }

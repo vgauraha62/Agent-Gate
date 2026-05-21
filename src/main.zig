@@ -4,12 +4,14 @@ const http = @import("server/http.zig");
 const http_async = @import("server/http_async.zig");
 const audit = @import("audit/logger.zig");
 const types = @import("policy/types.zig");
+const parser = @import("policy/parser.zig");
+const Memory = @import("memory.zig");
 const denial_tracker = @import("denial_tracker.zig");
 
 pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
     std.debug.print("AgentGate v1.0.0\n", .{});
 
@@ -69,21 +71,35 @@ pub fn main() !void {
     try denial_tracker.initGlobal(allocator);
     defer denial_tracker.deinitGlobal();
 
+    // Load policies from JSON file
+    const policy_file_path = config.policy.policy_file orelse "policies/default.json";
+    std.debug.print("[Startup] Loading policies from: {s}\n", .{policy_file_path});
+
+    var policy_arena = try Memory.SecurityArena.init(allocator, 65536);
+    defer policy_arena.deinit();
+
+    const policy_json = std.fs.cwd().readFileAlloc(allocator, policy_file_path, 1024 * 1024) catch |err| {
+        std.debug.print("[Startup] Failed to read policy file '{s}': {}\n", .{ policy_file_path, err });
+        return err;
+    };
+    defer allocator.free(policy_json);
+
+    const policy_file = try parser.parse(policy_json, &policy_arena);
+    const policy_set = types.PolicySet{ .policies = policy_file.policies };
+    std.debug.print("[Startup] Loaded {} policies from {s}\n", .{ policy_file.policies.len, policy_file_path });
+
     if (use_async_io) {
         std.debug.print("[Startup] Mode: async (epoll) - NO thread pool (fully async I/O)\n", .{});
 
         // Initialize audit logger with config
         var audit_logger = audit.AuditLogger.init(&config.audit);
 
-        // Define default policies
-        const default_policies = &[_]types.Policy{};
-
         // Create async server with config
         var server = http_async.Server.init(
             allocator,
             &config,
             &audit_logger,
-            default_policies,
+            policy_set.policies,
         );
         defer server.deinit();
 
@@ -98,15 +114,12 @@ pub fn main() !void {
         // Initialize audit logger with config
         var audit_logger = audit.AuditLogger.init(&config.audit);
 
-        // Define default policies (empty for benchmark)
-        const default_policies = &[_]types.Policy{};
-
         // Create server with config object
         var server = http.Server.init(
             allocator,
             &config,
             &audit_logger,
-            default_policies,
+            policy_set,
         );
         defer server.deinit();
 

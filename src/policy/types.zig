@@ -128,6 +128,8 @@ pub const Condition = union(enum) {
     method: Method,
     /// Match against multiple HTTP methods (any match).
     methods: []const Method,
+    /// Sleep for specified milliseconds then match (for timeout testing).
+    slow_match: u64,
 
     const Self = @This();
 
@@ -138,6 +140,10 @@ pub const Condition = union(enum) {
             .path => matchesPath(self.path, ctx.path),
             .method => self.method == ctx.method,
             .methods => matchesMethodAny(self.methods, ctx.method),
+            .slow_match => |ms| {
+                std.Thread.sleep(ms * std.time.ns_per_ms);
+                return true;
+            },
         };
     }
 };
@@ -228,6 +234,33 @@ pub const PolicySet = struct {
             .evaluation_time_ns = eval_time,
         };
     }
+
+    /// Evaluate the request context with a timeout.
+    /// Returns error.PolicyTimeout if evaluation exceeds timeout_ms.
+    /// Checks timeout both before and after matchesAll() to catch slow_match delays.
+    pub fn evaluateWithTimeout(self: *const Self, ctx: *const RequestContext, timeout_ms: u32) !Decision {
+        const start_time = std.time.nanoTimestamp();
+        const timeout_ns: i64 = @as(i64, timeout_ms) * std.time.ns_per_ms;
+
+        for (self.policies) |policy| {
+            // Check timeout BEFORE evaluation
+            if (std.time.nanoTimestamp() - start_time >= timeout_ns) return error.PolicyTimeout;
+
+            if (policy.matchesAll(ctx)) {
+                // Check timeout AFTER evaluation (catches slow_match delay)
+                if (std.time.nanoTimestamp() - start_time >= timeout_ns) return error.PolicyTimeout;
+
+                const eval_time = @as(u64, @intCast(std.time.nanoTimestamp() - start_time));
+                switch (policy.effect) {
+                    .allow => return Decision.allow(policy.id, eval_time),
+                    .deny => return Decision.deny(policy.id, eval_time),
+                }
+            }
+        }
+
+        const eval_time = @as(u64, @intCast(std.time.nanoTimestamp() - start_time));
+        return Decision.deny("default-deny", eval_time);
+    }
 };
 
 /// PolicyError - Errors for policy operations.
@@ -237,6 +270,7 @@ pub const PolicyError = error{
     InvalidPolicy,
     InvalidCondition,
     ParseError,
+    PolicyTimeout,
 };
 
 /// Match agent_id against pattern (supports "*" wildcard).
@@ -890,4 +924,86 @@ test "PolicySet: evaluate vs evaluateWithDecision consistency" {
     try std.testing.expectEqual(set.evaluate(&ctx_api), set.evaluateWithDecision(&ctx_api).effect);
     try std.testing.expectEqual(set.evaluate(&ctx_admin), set.evaluateWithDecision(&ctx_admin).effect);
     try std.testing.expectEqual(set.evaluate(&ctx_other), set.evaluateWithDecision(&ctx_other).effect);
+}
+
+// ============================================================================
+// slow_match condition tests
+// ============================================================================
+
+test "Condition: slow_match always returns true after sleeping" {
+    const ctx = RequestContext.init("agent", "/api/test", .GET);
+    const condition = Condition{ .slow_match = 1 }; // 1ms sleep
+
+    // Should return true after sleeping
+    try std.testing.expect(condition.matches(&ctx));
+}
+
+test "Condition: slow_match with path condition (AND logic)" {
+    const conditions = &[_]Condition{
+        Condition{ .path = "/api/*" },
+        Condition{ .slow_match = 1 },
+    };
+    const policy = Policy{
+        .id = "slow-api",
+        .effect = .allow,
+        .conditions = conditions,
+    };
+
+    // Both conditions must match
+    const ctx_match = RequestContext.init("agent", "/api/test", .GET);
+    try std.testing.expect(policy.matchesAll(&ctx_match));
+
+    // Path doesn't match - should return false (slow_match still sleeps)
+    const ctx_no_match = RequestContext.init("agent", "/other", .GET);
+    try std.testing.expect(!policy.matchesAll(&ctx_no_match));
+}
+
+test "PolicySet: evaluateWithTimeout returns decision within timeout" {
+    const policies = &[_]Policy{
+        Policy{
+            .id = "allow-api",
+            .effect = .allow,
+            .conditions = &[_]Condition{Condition{ .path = "/api/*" }},
+        },
+    };
+    const set = PolicySet{ .policies = policies };
+    const ctx = RequestContext.init("agent", "/api/test", .GET);
+
+    const decision = try set.evaluateWithTimeout(&ctx, 1000); // 1s timeout
+    try std.testing.expectEqual(Effect.allow, decision.effect);
+    try std.testing.expectEqualStrings("allow-api", decision.policy_id);
+}
+
+test "PolicySet: evaluateWithTimeout returns error.PolicyTimeout" {
+    const policies = &[_]Policy{
+        Policy{
+            .id = "slow-deny",
+            .effect = .deny,
+            .conditions = &[_]Condition{
+                Condition{ .path = "*" },
+                Condition{ .slow_match = 50 }, // 50ms sleep
+            },
+        },
+    };
+    const set = PolicySet{ .policies = policies };
+    const ctx = RequestContext.init("agent", "/api/test", .GET);
+
+    // 1ms timeout should trigger before 50ms slow_match completes
+    try std.testing.expectError(error.PolicyTimeout, set.evaluateWithTimeout(&ctx, 1));
+}
+
+test "PolicySet: evaluateWithTimeout default deny within timeout" {
+    const policies = &[_]Policy{
+        Policy{
+            .id = "allow-specific",
+            .effect = .allow,
+            .conditions = &[_]Condition{Condition{ .path = "/specific/*" }},
+        },
+    };
+    const set = PolicySet{ .policies = policies };
+    const ctx = RequestContext.init("agent", "/other", .GET);
+
+    const decision = try set.evaluateWithTimeout(&ctx, 1000);
+    try std.testing.expectEqual(Effect.deny, decision.effect);
+    try std.testing.expectEqualStrings("default-deny", decision.policy_id);
 }
