@@ -24,21 +24,29 @@ const config = @import("../config.zig");
 // Backward compatibility alias
 pub const AuditLogger = AuditLog;
 
-pub const BUFFER_SIZE = 1024;  // Power of two for fast masking
-pub const BUFFER_MASK = BUFFER_SIZE - 1;  // 0x3FF
+pub const DEFAULT_BUFFER_SIZE = 1024;  // Default power-of-two buffer size
+pub const DEFAULT_BUFFER_MASK = DEFAULT_BUFFER_SIZE - 1;
+pub const BUFFER_SIZE = DEFAULT_BUFFER_SIZE;  // Backward compatibility alias
+pub const BUFFER_MASK = DEFAULT_BUFFER_MASK;  // Backward compatibility alias
 pub const CHECKPOINT_INTERVAL = 128;
 
-/// Ultra-fast audit log with zero heap allocations in hot path
+/// Ultra-fast tamper-evident audit log with heap-allocated ring buffer.
+/// Buffer size is configured via AuditConfig.buffer_size (must be power of two).
+/// Zero heap allocations in hot path after initialization.
 pub const AuditLog = struct {
-    // Ring buffer (pre-allocated at compile time)
-    buffer: [BUFFER_SIZE]LogEntry = undefined,
-    write_index: u32 = 0,       // Current write position (0-1023)
+    // Ring buffer (heap-allocated based on config)
+    buffer: []LogEntry = &[0]LogEntry{},
+    buffer_mask: u32 = 0,       // buffer.len - 1 (for fast masking)
+    write_index: u32 = 0,       // Current write position
     sequence: u64 = 0,          // Monotonic counter (never wraps)
     latest_hash: [16]u8,        // Truncated hash of most recent entry
 
     // Checkpoint management
     checkpoints: [8]Checkpoint = undefined,
     checkpoint_count: u32 = 0,
+
+    // Allocator for freeing buffer
+    _allocator: std.mem.Allocator = undefined,
 
     // Signing (optional - can be set later)
     signer: ?*AuditSigner = null,
@@ -48,27 +56,37 @@ pub const AuditLog = struct {
     const ZERO_HASH: [16]u8 = [_]u8{0} ** 16;
     const ZERO_HASH_32: [32]u8 = [_]u8{0} ** 32;
 
-    /// Initialize empty audit log (zero allocation)
-    /// Accepts optional audit config for buffer size and timeout settings.
-    /// Note: Internal buffer size is compile-time constant (BUFFER_SIZE = 1024).
-    /// The config's buffer_size is used for validation/reference only.
-    pub fn init(cfg: *const config.AuditConfig) AuditLog {
-        _ = cfg; // Reserved for future use with dynamic buffer sizes
+    /// Initialize audit log with dynamic ring buffer based on config.
+    /// The buffer_size in config must be a power of two.
+    pub fn init(cfg: *const config.AuditConfig, allocator: std.mem.Allocator) !AuditLog {
+        const buffer_size = cfg.buffer_size;
+        if (buffer_size == 0 or (buffer_size & (buffer_size - 1)) != 0) {
+            return error.BufferSizeNotPowerOfTwo;
+        }
+        const buffer = try allocator.alloc(LogEntry, buffer_size);
         return AuditLog{
-            .buffer = undefined,
+            .buffer = buffer,
+            .buffer_mask = buffer_size - 1,
             .write_index = 0,
             .sequence = 0,
             .latest_hash = ZERO_HASH,
             .checkpoints = undefined,
             .checkpoint_count = 0,
+            ._allocator = allocator,
             .signer = null,
             .signer_initialized = false,
         };
     }
 
+    /// Free the allocated ring buffer.
+    pub fn deinit(self: *AuditLog) void {
+        self._allocator.free(self.buffer);
+        self.buffer = &[0]LogEntry{};
+    }
+
     /// Fast inline index masking (no modulo!)
-    inline fn maskIndex(idx: u32) u32 {
-        return idx & BUFFER_MASK;
+    inline fn maskIndex(self: *const AuditLog, idx: u32) u32 {
+        return idx & self.buffer_mask;
     }
 
 /// Compute hash of a single entry (includes previous hash for chain)
@@ -123,7 +141,7 @@ fn computeCheckpointHash(entry: *const LogEntry) [32]u8 {
         policy_id: u8,
     ) void {
         // Get current index
-        const idx = maskIndex(self.write_index);
+        const idx = self.maskIndex(self.write_index);
 
         // Compute path hash (16 bytes - done inline)
         const path_hash = truncateHash(path, 16);
@@ -147,7 +165,7 @@ fn computeCheckpointHash(entry: *const LogEntry) [32]u8 {
         self.buffer[idx] = entry;
 
         // Update state
-        self.write_index = maskIndex(self.write_index + 1);
+        self.write_index = self.maskIndex(self.write_index + 1);
         self.latest_hash = entry.current_hash;
         self.sequence += 1;
 
@@ -188,9 +206,9 @@ fn computeCheckpointHash(entry: *const LogEntry) [32]u8 {
     fn createCheckpoint(self: *AuditLog) void {
         // Get the last written entry (handle wrap-around)
         const last_idx = if (self.write_index == 0)
-            BUFFER_MASK
+            self.buffer_mask
         else
-            maskIndex(self.write_index - 1);
+            self.maskIndex(self.write_index - 1);
         const last_entry = self.buffer[last_idx];
 
         // Compute full 32-byte hash for checkpoint
@@ -240,14 +258,14 @@ fn computeCheckpointHash(entry: *const LogEntry) [32]u8 {
         if (sequence >= self.sequence) return null;
 
         // For entries before wrap-around, direct index works
-        if (sequence < BUFFER_SIZE) {
+        if (sequence < self.buffer.len) {
             const entry = self.buffer[@as(usize, @intCast(sequence))];
             if (entry.sequence != sequence) return null;
             return entry;
         }
 
         // After wrap-around, use modulo (wrapping is now part of sequence)
-        const wrapped_idx = @as(u32, @intCast(sequence)) & BUFFER_MASK;
+        const wrapped_idx = @as(u32, @intCast(sequence)) & self.buffer_mask;
         const entry = self.buffer[wrapped_idx];
         if (entry.sequence != sequence) return null;
         return entry;
@@ -282,26 +300,30 @@ fn computeCheckpointHash(entry: *const LogEntry) [32]u8 {
 // Tests
 // ============================================================================
 
-test "AuditLog: init zero allocation" {
-    const log = AuditLog.init();
-    try std.testing.expectEqual(@as(u48, 0), log.sequence);
+test "AuditLog: init with default config" {
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
+    try std.testing.expectEqual(@as(u64, 0), log.sequence);
     try std.testing.expectEqual(@as(u32, 0), log.write_index);
+    try std.testing.expectEqual(@as(usize, 1024), log.buffer.len);
 }
 
 test "AuditLog: log entry" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
 
     const agent_id = [_]u8{0xAA} ** 32;
 
     // Log one entry
     log.log(agent_id, "/api/test", .allow, 1);
 
-    try std.testing.expectEqual(@as(u48, 1), log.sequence);
+    try std.testing.expectEqual(@as(u64, 1), log.sequence);
     try std.testing.expect(log.latest_hash[0] != 0);  // Hash should be non-zero
 }
 
 test "AuditLog: hash chain continuity" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
 
     const agent_id = [_]u8{0xAA} ** 32;
 
@@ -317,27 +339,30 @@ test "AuditLog: hash chain continuity" {
 }
 
 test "AuditLog: ring buffer wrap-around" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{ .buffer_size = 1024 }, std.testing.allocator);
+    defer log.deinit();
     const agent_id = [_]u8{0xAA} ** 32;
 
-    // Write more than BUFFER_SIZE entries
-    for (0..BUFFER_SIZE + 10) |_| {
+    // Write more than buffer_size entries
+    const buf_len = log.buffer.len;
+    for (0..buf_len + 10) |_| {
         log.log(agent_id, "/api/test", .allow, 1);
     }
 
     // Sequence continues increasing
-    try std.testing.expect(log.sequence > BUFFER_SIZE);
+    try std.testing.expect(log.sequence > buf_len);
 
     // Any entry within the buffer window should be retrievable
-    // Test entry at sequence BUFFER_SIZE + 5
-    const test_seq = BUFFER_SIZE + 5;
+    // Test entry at sequence buf_len + 5
+    const test_seq = buf_len + 5;
     const entry = log.getEntry(test_seq);
     try std.testing.expect(entry != null);
     try std.testing.expectEqual(test_seq, entry.?.sequence);
 }
 
 test "AuditLog: checkpoint creation at interval" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
 
     // Signer for checkpoints
     var signer = AuditSigner.generate();
@@ -355,7 +380,8 @@ test "AuditLog: checkpoint creation at interval" {
 }
 
 test "AuditLog: getEntry O(1)" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     const agent_id = [_]u8{0xAA} ** 32;
 
     // Add some entries
@@ -365,19 +391,32 @@ test "AuditLog: getEntry O(1)" {
 
     // All entries should be retrievable
     for (0..10) |i| {
-        const entry = log.getEntry(@as(u48, @intCast(i)));
+        const entry = log.getEntry(@as(u64, @intCast(i)));
         try std.testing.expect(entry != null);
-        try std.testing.expectEqual(@as(u48, @intCast(i)), entry.?.sequence);
+        try std.testing.expectEqual(@as(u64, @intCast(i)), entry.?.sequence);
     }
 }
 
 test "AuditLog: entryCount accurate" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
+
     const agent_id = [_]u8{0xAA} ** 32;
 
     for (0..50) |_| {
         log.log(agent_id, "/api/test", .allow, 1);
     }
 
-    try std.testing.expectEqual(@as(u48, 50), log.entryCount());
+    try std.testing.expectEqual(@as(u64, 50), log.entryCount());
+}
+
+test "AuditLog: init with custom buffer size" {
+    var log = try AuditLog.init(&config.AuditConfig{ .buffer_size = 512 }, std.testing.allocator);
+    defer log.deinit();
+    try std.testing.expectEqual(@as(usize, 512), log.buffer.len);
+    try std.testing.expectEqual(@as(u32, 511), log.buffer_mask);
+}
+
+test "AuditLog: init rejects non-power-of-2 buffer size" {
+    try std.testing.expectError(error.BufferSizeNotPowerOfTwo, AuditLog.init(&config.AuditConfig{ .buffer_size = 100 }, std.testing.allocator));
 }

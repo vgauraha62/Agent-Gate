@@ -95,11 +95,27 @@ const server = b.addModule("server", .{ .root_source_file = b.path("src/server/h
     const e2e_server_run = b.addRunArtifact(e2e_server_obj);
     e2e_server_step.dependOn(&e2e_server_run.step);
 
+    // Config integration tests module
+    const config_test_module = b.createModule(.{
+        .root_source_file = b.path("src/config_integration_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const config_test_obj = b.addTest(.{
+        .root_module = config_test_module,
+    });
+
+    const config_test_step = b.step("test-config", "Run config integration tests");
+    const config_test_run = b.addRunArtifact(config_test_obj);
+    config_test_step.dependOn(&config_test_run.step);
+
     // Combined test step
-    const all_tests_step = b.step("test-all", "Run all tests (unit + E2E)");
+    const all_tests_step = b.step("test-all", "Run all tests (unit + E2E + config)");
     all_tests_step.dependOn(&test_run.step);
     all_tests_step.dependOn(&e2e_run.step);
     all_tests_step.dependOn(&e2e_server_run.step);
+    all_tests_step.dependOn(&config_test_run.step);
 
     // ============================================================================
     // Benchmark (Load Testing) Tool

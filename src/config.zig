@@ -140,189 +140,71 @@ fn parseExternalPolicy(value: []const u8) EnvParseError!ExternalPolicy {
 // Environment Variable Override System
 // ============================================================================
 
+// Comptime validation: ensures all config struct fields have supported types
+// for env var overrides. If you add a new field to any sub-config and its type
+// is not listed below, you MUST add parsing support in parseEnvValue().
+// Fields with types not listed here will silently fall through to the
+// UnsupportedType catch-all — add support if the field should be overridable.
+comptime {
+    const sub_configs = [_]type{ ServerConfig, AuthConfig, PolicyConfig, AuditConfig, RequestConfig, ShutdownConfig, TLSConfig };
+    for (sub_configs) |SubT| {
+        for (std.meta.fields(SubT)) |field| {
+            switch (field.type) {
+                // Types with explicit parsing support in parseEnvValue
+                u8, u16, u32, u64,
+                i8, i16, i32, i64,
+                usize,
+                bool, []const u8,
+                TLSMode, ExternalPolicy => {},
+                // Types that fall through to UnsupportedType catch-all
+                // These fields are NOT overridable via env vars — intentional
+                ?[]const u8, []const []const u8 => {},
+                else => @compileError(
+                    "Unsupported type '" ++ @typeName(field.type) ++
+                    "' for field '" ++ field.name ++ "' in " ++ @typeName(SubT) ++
+                    ". Add parsing support to parseEnvValue() or add the type to the comptime list above.",
+                ),
+            }
+        }
+    }
+}
+
 /// Apply environment variable overrides to a Config struct.
 /// Uses flattened naming: AGENTGATE_SERVER_PORT for config.server.port
 pub fn applyOverrides(config: *Config, allocator: std.mem.Allocator) void {
-    // Apply overrides to server config (nested struct)
-    applyServerOverrides(&config.server, allocator);
-
-    // Apply overrides to auth config (nested struct)
-    applyAuthOverrides(&config.auth, allocator);
-
-    // Apply overrides to policy config (nested struct)
-    applyPolicyOverrides(&config.policy, allocator);
-
-    // Apply overrides to audit config (nested struct)
-    applyAuditOverrides(&config.audit, allocator);
-
-    // Apply overrides to request config (nested struct)
-    applyRequestOverrides(&config.request, allocator);
-
-    // Apply overrides to shutdown config (nested struct)
-    applyShutdownOverrides(&config.shutdown, allocator);
-
-    // Apply overrides to TLS config (nested struct)
-    applyTLSOverrides(&config.tls, allocator);
+    applyOverridesFor(ServerConfig, &config.server, "SERVER", allocator);
+    applyOverridesFor(AuthConfig, &config.auth, "AUTH", allocator);
+    applyOverridesFor(PolicyConfig, &config.policy, "POLICY", allocator);
+    applyOverridesFor(AuditConfig, &config.audit, "AUDIT", allocator);
+    applyOverridesFor(RequestConfig, &config.request, "REQUEST", allocator);
+    applyOverridesFor(ShutdownConfig, &config.shutdown, "SHUTDOWN", allocator);
+    applyOverridesFor(TLSConfig, &config.tls, "TLS", allocator);
 }
 
-/// Apply overrides to ServerConfig fields
-fn applyServerOverrides(target: *ServerConfig, allocator: std.mem.Allocator) void {
-    inline for (std.meta.fields(ServerConfig)) |field| {
+/// Generic function to apply environment variable overrides to any config struct.
+/// Environment variable naming: AGENTGATE_<PREFIX>_<FIELD_NAME>
+/// Example: AGENTGATE_SERVER_PORT overrides ServerConfig.port
+///
+/// Uses std.posix.getenv (borrowed reference to process environment) instead of
+/// getEnvVarOwned to avoid allocations and use-after-free on string fields.
+/// The environ pointer is valid for the process lifetime.
+fn applyOverridesFor(comptime T: type, target: *T, comptime prefix: []const u8, allocator: std.mem.Allocator) void {
+    inline for (std.meta.fields(T)) |field| {
         const field_upper = toUpperAlloc(field.name, allocator) catch return;
         defer allocator.free(field_upper);
 
-        const env_parts = [_][]const u8{ "AGENTGATE_SERVER_", field_upper };
-        const env_name = std.mem.concat(allocator, u8, &env_parts) catch return;
+        const env_name = std.fmt.allocPrint(allocator, "AGENTGATE_{s}_{s}", .{ prefix, field_upper }) catch return;
         defer allocator.free(env_name);
 
-        if (std.process.getEnvVarOwned(allocator, env_name)) |env_value| {
-            defer allocator.free(env_value);
-
+        // Borrowed reference to process environment - valid for process lifetime.
+        // No allocation, no use-after-free for string fields.
+        if (std.posix.getenv(env_name)) |env_value| {
             const parsed = parseEnvValue(field.type, env_value) catch {
                 std.debug.print("[Config] Warning: Invalid value '{s}' for {s}, keeping default\n", .{ env_value, env_name });
                 return;
             };
-
             @field(target, field.name) = parsed;
-        } else |_| {}
-    }
-}
-
-/// Apply overrides to AuthConfig fields
-fn applyAuthOverrides(target: *AuthConfig, allocator: std.mem.Allocator) void {
-    inline for (std.meta.fields(AuthConfig)) |field| {
-        const field_upper = toUpperAlloc(field.name, allocator) catch return;
-        defer allocator.free(field_upper);
-
-        const env_parts = [_][]const u8{ "AGENTGATE_AUTH_", field_upper };
-        const env_name = std.mem.concat(allocator, u8, &env_parts) catch return;
-        defer allocator.free(env_name);
-
-        if (std.process.getEnvVarOwned(allocator, env_name)) |env_value| {
-            defer allocator.free(env_value);
-
-            const parsed = parseEnvValue(field.type, env_value) catch {
-                std.debug.print("[Config] Warning: Invalid value '{s}' for {s}, keeping default\n", .{ env_value, env_name });
-                return;
-            };
-
-            @field(target, field.name) = parsed;
-        } else |_| {}
-    }
-}
-
-/// Apply overrides to PolicyConfig fields
-fn applyPolicyOverrides(target: *PolicyConfig, allocator: std.mem.Allocator) void {
-    inline for (std.meta.fields(PolicyConfig)) |field| {
-        const field_upper = toUpperAlloc(field.name, allocator) catch return;
-        defer allocator.free(field_upper);
-
-        const env_parts = [_][]const u8{ "AGENTGATE_POLICY_", field_upper };
-        const env_name = std.mem.concat(allocator, u8, &env_parts) catch return;
-        defer allocator.free(env_name);
-
-        if (std.process.getEnvVarOwned(allocator, env_name)) |env_value| {
-            defer allocator.free(env_value);
-
-            const parsed = parseEnvValue(field.type, env_value) catch {
-                std.debug.print("[Config] Warning: Invalid value '{s}' for {s}, keeping default\n", .{ env_value, env_name });
-                return;
-            };
-
-            @field(target, field.name) = parsed;
-        } else |_| {}
-    }
-}
-
-/// Apply overrides to AuditConfig fields
-fn applyAuditOverrides(target: *AuditConfig, allocator: std.mem.Allocator) void {
-    inline for (std.meta.fields(AuditConfig)) |field| {
-        const field_upper = toUpperAlloc(field.name, allocator) catch return;
-        defer allocator.free(field_upper);
-
-        const env_parts = [_][]const u8{ "AGENTGATE_AUDIT_", field_upper };
-        const env_name = std.mem.concat(allocator, u8, &env_parts) catch return;
-        defer allocator.free(env_name);
-
-        if (std.process.getEnvVarOwned(allocator, env_name)) |env_value| {
-            defer allocator.free(env_value);
-
-            const parsed = parseEnvValue(field.type, env_value) catch {
-                std.debug.print("[Config] Warning: Invalid value '{s}' for {s}, keeping default\n", .{ env_value, env_name });
-                return;
-            };
-
-            @field(target, field.name) = parsed;
-        } else |_| {}
-    }
-}
-
-/// Apply overrides to RequestConfig fields
-fn applyRequestOverrides(target: *RequestConfig, allocator: std.mem.Allocator) void {
-    inline for (std.meta.fields(RequestConfig)) |field| {
-        const field_upper = toUpperAlloc(field.name, allocator) catch return;
-        defer allocator.free(field_upper);
-
-        const env_parts = [_][]const u8{ "AGENTGATE_REQUEST_", field_upper };
-        const env_name = std.mem.concat(allocator, u8, &env_parts) catch return;
-        defer allocator.free(env_name);
-
-        if (std.process.getEnvVarOwned(allocator, env_name)) |env_value| {
-            defer allocator.free(env_value);
-
-            const parsed = parseEnvValue(field.type, env_value) catch {
-                std.debug.print("[Config] Warning: Invalid value '{s}' for {s}, keeping default\n", .{ env_value, env_name });
-                return;
-            };
-
-            @field(target, field.name) = parsed;
-        } else |_| {}
-    }
-}
-
-/// Apply overrides to ShutdownConfig fields
-fn applyShutdownOverrides(target: *ShutdownConfig, allocator: std.mem.Allocator) void {
-    inline for (std.meta.fields(ShutdownConfig)) |field| {
-        const field_upper = toUpperAlloc(field.name, allocator) catch return;
-        defer allocator.free(field_upper);
-
-        const env_parts = [_][]const u8{ "AGENTGATE_SHUTDOWN_", field_upper };
-        const env_name = std.mem.concat(allocator, u8, &env_parts) catch return;
-        defer allocator.free(env_name);
-
-        if (std.process.getEnvVarOwned(allocator, env_name)) |env_value| {
-            defer allocator.free(env_value);
-
-            const parsed = parseEnvValue(field.type, env_value) catch {
-                std.debug.print("[Config] Warning: Invalid value '{s}' for {s}, keeping default\n", .{ env_value, env_name });
-                return;
-            };
-
-            @field(target, field.name) = parsed;
-        } else |_| {}
-    }
-}
-
-/// Apply overrides to TLSConfig fields
-fn applyTLSOverrides(target: *TLSConfig, allocator: std.mem.Allocator) void {
-    inline for (std.meta.fields(TLSConfig)) |field| {
-        const field_upper = toUpperAlloc(field.name, allocator) catch return;
-        defer allocator.free(field_upper);
-
-        const env_parts = [_][]const u8{ "AGENTGATE_TLS_", field_upper };
-        const env_name = std.mem.concat(allocator, u8, &env_parts) catch return;
-        defer allocator.free(env_name);
-
-        if (std.process.getEnvVarOwned(allocator, env_name)) |env_value| {
-            defer allocator.free(env_value);
-
-            const parsed = parseEnvValue(field.type, env_value) catch {
-                std.debug.print("[Config] Warning: Invalid value '{s}' for {s}, keeping default\n", .{ env_value, env_name });
-                return;
-            };
-
-            @field(target, field.name) = parsed;
-        } else |_| {}
+        }
     }
 }
 
@@ -483,8 +365,8 @@ pub const PolicyConfig = struct {
 
 /// Audit configuration.
 pub const AuditConfig = struct {
-    /// Audit log ring buffer size.
-    buffer_size: u32 = 1000,
+    /// Audit log ring buffer size (must be power of two).
+    buffer_size: u32 = 1024,
     /// Audit log timeout in milliseconds.
     audit_timeout_ms: u32 = 10,
 };
@@ -533,48 +415,50 @@ pub const Config = struct {
 
     /// Load TLS configuration with environment variable overrides.
     /// Environment variables take priority over config file values.
+    /// Uses std.posix.getenv (borrowed reference) to avoid allocations.
     pub fn loadTLSFromEnv(self: *Self, allocator: std.mem.Allocator) void {
+        _ = allocator; // Used only for consistency with applyOverrides API
         // Only override if TLS was enabled in config file
         if (self.tls.mode == .disabled) return;
 
         // Override TLS mode
-        if (std.process.getEnvVarOwned(allocator, "AGENTGATE_TLS_MODE")) |mode_str| {
-            if (std.mem.eql(u8, mode_str, "native")) {
+        if (std.posix.getenv("AGENTGATE_TLS_MODE")) |mode_str| {
+            if (std.ascii.eqlIgnoreCase(mode_str, "native")) {
                 self.tls.mode = .native;
-            } else if (std.mem.eql(u8, mode_str, "external")) {
+            } else if (std.ascii.eqlIgnoreCase(mode_str, "external")) {
                 self.tls.mode = .external;
-            } else if (std.mem.eql(u8, mode_str, "disabled")) {
+            } else if (std.ascii.eqlIgnoreCase(mode_str, "disabled")) {
                 self.tls.mode = .disabled;
             }
-        } else |_| {}
+        }
 
         // Override CA certificate path
-        if (std.process.getEnvVarOwned(allocator, "AGENTGATE_TLS_CA")) |ca_path| {
+        if (std.posix.getenv("AGENTGATE_TLS_CA")) |ca_path| {
             self.tls.ca_cert_path = ca_path;
-        } else |_| {}
+        }
 
         // Override server certificate path
-        if (std.process.getEnvVarOwned(allocator, "AGENTGATE_TLS_CERT")) |cert_path| {
+        if (std.posix.getenv("AGENTGATE_TLS_CERT")) |cert_path| {
             self.tls.server_cert_path = cert_path;
-        } else |_| {}
+        }
 
         // Override server key path
-        if (std.process.getEnvVarOwned(allocator, "AGENTGATE_TLS_KEY")) |key_path| {
+        if (std.posix.getenv("AGENTGATE_TLS_KEY")) |key_path| {
             self.tls.server_key_path = key_path;
-        } else |_| {}
+        }
 
         // Override trusted proxy IP for external mode
-        if (std.process.getEnvVarOwned(allocator, "AGENTGATE_TLS_TRUSTED_PROXY")) |proxy_ip| {
+        if (std.posix.getenv("AGENTGATE_TLS_TRUSTED_PROXY")) |proxy_ip| {
             self.tls.trusted_proxy_ip = proxy_ip;
-        } else |_| {}
+        }
     }
 
     /// Clean up owned allocations.
-    /// Call this when config is no longer needed.
+    /// Uses std.posix.getenv for env var lookup (borrowed environ pointer),
+    /// so no owned allocations need to be freed here. All string fields
+    /// point to either compile-time constants, JSON file memory managed
+    /// by the caller, or the process environment block.
     pub fn deinit(self: *Self) void {
-        // Currently all fields are either primitives or slices pointing to
-        // external/interned strings. If we add owned allocations in the future,
-        // clean them up here.
         _ = self;
     }
 
@@ -604,6 +488,11 @@ pub const Config = struct {
         // Audit timeout should be less than request timeout
         if (self.audit.audit_timeout_ms >= self.request.request_timeout_ms) {
             return error.AuditTimeoutExceedsRequestTimeout;
+        }
+
+        // Audit buffer size must be a power of two
+        if (self.audit.buffer_size == 0 or (self.audit.buffer_size & (self.audit.buffer_size - 1)) != 0) {
+            return error.InvalidBufferSize;
         }
 
         // Validate TLS configuration
@@ -675,6 +564,7 @@ pub const ConfigError = error{
     AuditTimeoutExceedsRequestTimeout,
     ParseError,
     FileNotFound,
+    InvalidBufferSize,
     TLSCARequired,
     TLSServerCertRequired,
     TLSServerKeyRequired,

@@ -8,6 +8,7 @@ const SecurityArena = @import("memory.zig").SecurityArena;
 const Secret = @import("secret.zig").Secret;
 const AuditLogger = @import("audit/logger.zig").AuditLogger;
 const types = @import("policy/types.zig");
+const config = @import("config.zig");
 
 // ============================================================================
 // Test Configuration
@@ -21,7 +22,8 @@ const TEST_SECRET = "test-secret-key-32-bytes-exact!!";
 
 test "E2E: Policy -> Audit with Decision struct" {
 
-    var audit_logger = AuditLogger.init();
+    var audit_logger = try AuditLogger.init(&config.AuditConfig{}, std.testing.allocator);
+    defer audit_logger.deinit();
 
     // Define policies
     const policies = &[_]types.Policy{
@@ -63,7 +65,8 @@ test "E2E: Policy -> Audit with Decision struct" {
 
 test "E2E: Policy deny -> 403 logged with correct policy_id" {
 
-    var audit_logger = AuditLogger.init();
+    var audit_logger = try AuditLogger.init(&config.AuditConfig{}, std.testing.allocator);
+    defer audit_logger.deinit();
 
     // Policy that denies /admin/*
     const policies = &[_]types.Policy{
@@ -97,7 +100,8 @@ test "E2E: Policy deny -> 403 logged with correct policy_id" {
 
 test "E2E: Multiple requests -> audit log preserves order" {
 
-    var audit_logger = AuditLogger.init();
+    var audit_logger = try AuditLogger.init(&config.AuditConfig{}, std.testing.allocator);
+    defer audit_logger.deinit();
 
     // Simulate multiple requests
     const scenarios = &[_]struct { agent: []const u8, path: []const u8, policy: []const u8 }{
@@ -253,7 +257,8 @@ test "E2E: Policy ordering - first match wins even with conflicting effects" {
 // ============================================================================
 
 test "E2E: Audit log with Decision struct integration" {
-    var audit_logger = AuditLogger.init();
+    var audit_logger = try AuditLogger.init(&config.AuditConfig{}, std.testing.allocator);
+    defer audit_logger.deinit();
 
     // Simulate various decisions
     const decisions = &[_]struct {
@@ -296,7 +301,8 @@ test "E2E: Audit log with Decision struct integration" {
 
 test "E2E: Audit logger handles rapid sequential writes" {
     const gpa = std.testing.allocator;
-    var audit_logger = AuditLogger.init();
+    var audit_logger = try AuditLogger.init(&config.AuditConfig{}, std.testing.allocator);
+    defer audit_logger.deinit();
 
     // Simulate rapid requests
     const num_requests = 100;

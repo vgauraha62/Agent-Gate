@@ -92,7 +92,8 @@ pub fn main() !void {
         std.debug.print("[Startup] Mode: async (epoll) - NO thread pool (fully async I/O)\n", .{});
 
         // Initialize audit logger with config
-        var audit_logger = audit.AuditLogger.init(&config.audit);
+        var audit_logger = try audit.AuditLogger.init(&config.audit, allocator);
+        defer audit_logger.deinit();
 
         // Create async server with config
         var server = http_async.Server.init(
@@ -112,7 +113,8 @@ pub fn main() !void {
         std.debug.print("[Startup] Starting HTTP server on port {d}...\n", .{config.server.port});
 
         // Initialize audit logger with config
-        var audit_logger = audit.AuditLogger.init(&config.audit);
+        var audit_logger = try audit.AuditLogger.init(&config.audit, allocator);
+        defer audit_logger.deinit();
 
         // Create server with config object
         var server = http.Server.init(

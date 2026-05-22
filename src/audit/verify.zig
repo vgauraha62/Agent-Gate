@@ -20,6 +20,7 @@ const Checkpoint = types.Checkpoint;
 const crypto_audit = @import("crypto.zig");
 const AuditSigner = crypto_audit.AuditSigner;
 const verifyCheckpoint = crypto_audit.verifyCheckpoint;
+const config = @import("../config.zig");
 
 /// Verification result with detailed error information
 pub const VerifyResult = struct {
@@ -186,13 +187,15 @@ const AuditLog = logger_module.AuditLog;
 const CHECKPOINT_INTERVAL = logger_module.CHECKPOINT_INTERVAL;
 
 test "verifyIntegrity: empty log" {
-    const log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     const result = verifyIntegrity(&log, null);
     try std.testing.expect(result.valid);
 }
 
 test "verifyIntegrity: valid log passes" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     var signer = try AuditSigner.generate();
     log.enableSigning(&signer);
 
@@ -209,7 +212,8 @@ test "verifyIntegrity: valid log passes" {
 }
 
 test "verifyIntegrity: tampered entry fails" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     var signer = try AuditSigner.generate();
     log.enableSigning(&signer);
 
@@ -231,7 +235,8 @@ test "verifyIntegrity: tampered entry fails" {
 }
 
 test "verifyIntegrity: modified hash fails" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     const agent_id = [_]u8{0xAA} ** 32;
 
     for (0..10) |_| {
@@ -250,7 +255,8 @@ test "verifyIntegrity: modified hash fails" {
 }
 
 test "verifyIntegrity: checkpoint signature verified" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     var signer = try AuditSigner.generate();
     log.enableSigning(&signer);
 
@@ -272,7 +278,8 @@ test "verifyIntegrity: checkpoint signature verified" {
 }
 
 test "quickVerify: passes for valid log" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     const agent_id = [_]u8{0xAA} ** 32;
 
     for (0..50) |_| {
@@ -283,7 +290,8 @@ test "quickVerify: passes for valid log" {
 }
 
 test "quickVerify: fails for tampered log" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     const agent_id = [_]u8{0xAA} ** 32;
 
     for (0..20) |_| {

@@ -9,6 +9,7 @@ const Secret = @import("secret.zig").Secret;
 const AuditLogger = @import("audit/logger.zig").AuditLogger;
 const audit = @import("audit/logger.zig");
 const types = @import("policy/types.zig");
+const config = @import("config.zig");
 const jwt = @import("auth/jwt.zig");
 const auth_middleware = @import("server/auth_middleware.zig");
 
@@ -33,7 +34,8 @@ fn generateExpiredToken(allocator: std.mem.Allocator, sub: []const u8) ![]u8 {
 test "E2E Server: Full policy + audit pipeline" {
 
     // Initialize audit logger
-    var audit_logger = AuditLogger.init();
+    var audit_logger = try AuditLogger.init(&config.AuditConfig{}, std.testing.allocator);
+    defer audit_logger.deinit();
 
     // Define test policies
     const policies = &[_]types.Policy{
@@ -184,7 +186,8 @@ test "E2E Server: Decision struct has correct evaluation_time_ns" {
 
 test "E2E Server: Ring buffer wraps around correctly" {
     const gpa = std.testing.allocator;
-    var audit_logger = AuditLogger.init();
+    var audit_logger = try AuditLogger.init(&config.AuditConfig{}, std.testing.allocator);
+    defer audit_logger.deinit();
 
     // Write more entries than buffer size
     const buffer_size = audit.BUFFER_SIZE;
@@ -272,7 +275,8 @@ test "E2E Server: Method-based policy evaluation" {
 // ============================================================================
 
 test "E2E Server: Audit entry contains all required fields" {
-    var audit_logger = AuditLogger.init();
+    var audit_logger = try AuditLogger.init(&config.AuditConfig{}, std.testing.allocator);
+    defer audit_logger.deinit();
 
     // Log a complete entry
     audit_logger.logCompat(
@@ -299,7 +303,8 @@ test "E2E Server: Audit entry contains all required fields" {
 }
 
 test "E2E Server: Audit sequence numbering is correct" {
-    var audit_logger = AuditLogger.init();
+    var audit_logger = try AuditLogger.init(&config.AuditConfig{}, std.testing.allocator);
+    defer audit_logger.deinit();
 
     // Log entries and verify sequence
     var expected_seq: u64 = 1;

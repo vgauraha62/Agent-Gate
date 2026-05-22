@@ -10,6 +10,7 @@ const std = @import("std");
 const audit_logger = @import("audit/logger.zig");
 const audit_crypto = @import("audit/crypto.zig");
 const audit_verify = @import("audit/verify.zig");
+const config = @import("../config.zig");
 
 const AuditLog = audit_logger.AuditLog;
 const AuditSigner = audit_crypto.AuditSigner;
@@ -23,7 +24,8 @@ test "Integration: Full audit pipeline" {
     const public_key = signer.publicKey();
 
     // 2. Initialize audit log with signer
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     log.enableSigning(&signer);
 
     const agent_id = [_]u8{0xAB} ** 32;
@@ -41,7 +43,8 @@ test "Integration: Full audit pipeline" {
 }
 
 test "Integration: Tamper detection - modify entry data" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     var signer = AuditSigner.generate();
     log.enableSigning(&signer);
 
@@ -68,7 +71,8 @@ test "Integration: Tamper detection - modify entry data" {
 }
 
 test "Integration: Tamper detection - modify hash" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     var signer = AuditSigner.generate();
     log.enableSigning(&signer);
 
@@ -94,7 +98,8 @@ test "Integration: Tamper detection - modify hash" {
 }
 
 test "Integration: Checkpoint signing every 128 entries" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     var signer = AuditSigner.generate();
     log.enableSigning(&signer);
 
@@ -119,7 +124,8 @@ test "Integration: Checkpoint signing every 128 entries" {
 }
 
 test "Integration: Quick verify without signatures" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     // No signer - testing quickVerify path
 
     const agent_id = [_]u8{0x34} ** 32;
@@ -140,7 +146,8 @@ test "Integration: Quick verify without signatures" {
 }
 
 test "Integration: Ring buffer wrap preserves integrity" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     var signer = AuditSigner.generate();
     log.enableSigning(&signer);
 
@@ -161,7 +168,8 @@ test "Integration: Ring buffer wrap preserves integrity" {
 }
 
 test "Integration: Hash chain continuity after wrap" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     var signer = AuditSigner.generate();
     log.enableSigning(&signer);
 
@@ -184,7 +192,8 @@ test "Integration: Hash chain continuity after wrap" {
 }
 
 test "Integration: Multiple checkpoints maintained" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     var signer = AuditSigner.generate();
     log.enableSigning(&signer);
 
@@ -217,7 +226,8 @@ test "Integration: Public key export for auditors" {
     try std.testing.expectEqual(@as(usize, 32), public_key.len);
 
     // Verify can be exported
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     log.enableSigning(&signer);
 
     const agent_id = [_]u8{0xBC} ** 32;
@@ -229,7 +239,8 @@ test "Integration: Public key export for auditors" {
 }
 
 test "Integration: Empty log verification" {
-    const log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
 
     // Empty log should pass verification
     const result = verifyIntegrity(&log, null);
@@ -238,7 +249,8 @@ test "Integration: Empty log verification" {
 }
 
 test "Integration: logCompat backward compatibility" {
-    var log = AuditLog.init();
+    var log = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer log.deinit();
     // No signer - using backward-compatible API
 
     // Use the string-based API for backward compatibility

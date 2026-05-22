@@ -2,6 +2,7 @@ const std = @import("std");
 const http = @import("server/http.zig");
 const audit = @import("audit/logger.zig");
 const types = @import("policy/types.zig");
+const config = @import("config.zig");
 const AuditLog = audit.AuditLog;
 
 test "HttpStatus enum values" {
@@ -38,41 +39,48 @@ test "CheckRequest struct" {
 }
 
 test "ServerInit creates valid server" {
-    var audit_logger = AuditLog.init();
+    var audit_logger = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer audit_logger.deinit();
 
-    const policies = &[_]types.Policy{types.Policy{
+    const policy_set = types.PolicySet{ .policies = &[_]types.Policy{types.Policy{
         .id = "test",
         .effect = .allow,
         .conditions = &[_]types.Condition{},
-    }};
+    }} };
 
-    // Note: Middleware is optional for basic Server init test
-    const server = http.Server.init(std.heap.page_allocator, 8080, &audit_logger, policies, "secret-key", .async_epoll);
+    var cfg = config.Config.default();
+    cfg.server.port = 8080;
+    cfg.auth.jwt_secret = "secret-key-32-bytes-long-enough!!!";
+
+    const server = http.Server.init(std.heap.page_allocator, &cfg, &audit_logger, policy_set);
 
     try std.testing.expectEqual(@as(u16, 8080), server.port);
 }
 
 test "AuditLog log entry" {
-    var logger = AuditLog.init();
+    var logger = try AuditLog.init(&config.AuditConfig{}, std.testing.allocator);
+    defer logger.deinit();
     const agent_id = [_]u8{0xAA} ** 32;
 
     logger.log(agent_id, "/api/test", .allow, 1);
 
-    try std.testing.expectEqual(@as(u48, 1), logger.entryCount());
+    try std.testing.expectEqual(@as(u64, 1), logger.entryCount());
 
     const entry = logger.getEntry(0);
     try std.testing.expect(entry != null);
 }
 
 test "AuditLog ring buffer wrap" {
-    var logger = AuditLog.init();
+    var logger = try AuditLog.init(&config.AuditConfig{ .buffer_size = 1024 }, std.testing.allocator);
+    defer logger.deinit();
     const agent_id = [_]u8{0xAA} ** 32;
 
-    for (0..audit.BUFFER_SIZE + 5) |_| {
+    const buf_len = logger.buffer.len;
+    for (0..buf_len + 5) |_| {
         logger.log(agent_id, "/api/test", .allow, 1);
     }
 
-    try std.testing.expectEqual(@as(u48, audit.BUFFER_SIZE + 5), logger.entryCount());
+    try std.testing.expectEqual(@as(u64, buf_len + 5), logger.entryCount());
 }
 
 test "Policy types - Method parse" {

@@ -1,7 +1,7 @@
 # Task Plan: Day 11 Performance Optimization
 
 ## Goal
-Achieve sub-500µs P99 latency through zero-copy parsing and compile-time policy optimization.
+Achieve sub-50µs P99 latency through zero-copy parsing and compile-time policy optimization.
 
 ## Implementation Units
 
@@ -9,9 +9,9 @@ Achieve sub-500µs P99 latency through zero-copy parsing and compile-time policy
 - [ ] U2. **Compile-Time Policy Optimization**: Implement decision tree generation in `src/policy/engine.zig` using `comptime`. Merge overlapping rules.
 - [ ] U3. **Perfect Hash Lookup**: Implement fast lookup for policy evaluation.
 - [ ] U4. **Latency Benchmarking**: Create `benchmark.zig` to measure P99 latency.
-- [ ] U5. **Validation**: Verify sub-500µs target under load.
+- [ ] U5. **Validation**: Verify sub-50µs target under load.
 
 ## Verification
-- [ ] `zig build benchmark` shows P99 < 500µs.
+- [ ] `zig build benchmark` shows P99 < 50µs.
 - [ ] Memory usage remains steady (no leaks during zero-copy parsing).
 - [ ] Policy decisions remain correct after optimization.
