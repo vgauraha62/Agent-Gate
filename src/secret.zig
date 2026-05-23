@@ -109,3 +109,5 @@ test "Secret with binary data" {
 
     try std.testing.expectEqualSlices(u8, &binary_data, secret.asBytes());
 }
+
+

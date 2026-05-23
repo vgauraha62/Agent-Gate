@@ -1,0 +1,1 @@
+{"version":"1","policies":[{"path":"/api/users","allow":[".*"],"require_audit":false}]}

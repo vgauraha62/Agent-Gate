@@ -27,25 +27,16 @@ pub const SecurityArena = struct {
 
     /// Allocate memory from the arena.
     /// Returns error.OutOfMemory if the arena is exhausted.
+    /// The returned slice may be larger than `size` due to 8-byte alignment padding.
     pub fn alloc(self: *Self, size: usize) ![]u8 {
-        if (self.index + size > self.buffer.len) {
+        // Align the current position first, then bump
+        const start = std.mem.alignForward(usize, self.index, 8);
+        const end = start + size;
+        if (end > self.buffer.len) {
             return error.OutOfMemory;
         }
-
-        const start = self.index;
-        self.index += size;
-
-        // Align to 8 bytes for proper pointer alignment
-        const aligned_start = std.mem.alignForward(usize, start, 8);
-        const aligned_size = std.mem.alignForward(usize, size, 8);
-        _ = aligned_size; // Used for alignment calculation
-
-        // Adjust if we had to align
-        if (aligned_start != start) {
-            self.index = aligned_start + size;
-        }
-
-        return self.buffer[start..self.index];
+        self.index = end;
+        return self.buffer[start..end];
     }
 
     /// Reset the arena to its initial state.

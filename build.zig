@@ -110,12 +110,62 @@ const server = b.addModule("server", .{ .root_source_file = b.path("src/server/h
     const config_test_run = b.addRunArtifact(config_test_obj);
     config_test_step.dependOn(&config_test_run.step);
 
+    // Security integration tests (formerly orphaned — src/integration_test.zig)
+    const security_test_module = b.createModule(.{
+        .root_source_file = b.path("src/integration_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const security_test_obj = b.addTest(.{
+        .root_module = security_test_module,
+    });
+
+    const security_test_step = b.step("test-security", "Run SecurityArena/Secret/Agent integration tests");
+    const security_test_run = b.addRunArtifact(security_test_obj);
+    security_test_step.dependOn(&security_test_run.step);
+
+    // Audit integration tests (formerly orphaned — src/audit/integration_test.zig).
+    // Uses wrapper at src/ level so module root = src/, allowing @import("../config.zig")
+    // in src/audit/ files to resolve within the module path.
+    const audit_test_module = b.createModule(.{
+        .root_source_file = b.path("src/audit_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const audit_test_obj = b.addTest(.{
+        .root_module = audit_test_module,
+    });
+
+    const audit_test_step = b.step("test-audit", "Run audit log integrity integration tests");
+    const audit_test_run = b.addRunArtifact(audit_test_obj);
+    audit_test_step.dependOn(&audit_test_run.step);
+
+    // Gap coverage tests (edge cases not covered by existing unit/integration tests)
+    const gap_test_module = b.createModule(.{
+        .root_source_file = b.path("src/gap_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const gap_test_obj = b.addTest(.{
+        .root_module = gap_test_module,
+    });
+
+    const gap_test_step = b.step("test-gaps", "Run coverage gap tests (edge cases, boundary conditions)");
+    const gap_test_run = b.addRunArtifact(gap_test_obj);
+    gap_test_step.dependOn(&gap_test_run.step);
+
     // Combined test step
-    const all_tests_step = b.step("test-all", "Run all tests (unit + E2E + config)");
+    const all_tests_step = b.step("test-all", "Run all tests (unit + E2E + config + security + audit + gaps)");
     all_tests_step.dependOn(&test_run.step);
     all_tests_step.dependOn(&e2e_run.step);
     all_tests_step.dependOn(&e2e_server_run.step);
     all_tests_step.dependOn(&config_test_run.step);
+    all_tests_step.dependOn(&security_test_run.step);
+    all_tests_step.dependOn(&audit_test_run.step);
+    all_tests_step.dependOn(&gap_test_run.step);
 
     // ============================================================================
     // Benchmark (Load Testing) Tool
@@ -167,4 +217,56 @@ const server = b.addModule("server", .{ .root_source_file = b.path("src/server/h
 
     const benchmark_step = b.step("benchmark", "Run load testing benchmark");
     benchmark_step.dependOn(&benchmark_run_cmd.step);
+
+    // ============================================================================
+    // Fuzzing Targets
+    // ============================================================================
+    // Fuzz targets live at src/ level so file-path imports resolve within src/.
+    // For libFuzzer mode, compile with -fsanitize=fuzzer externally.
+
+    // --- fuzz_jwt ---
+    const fuzz_jwt_module = b.createModule(.{
+        .root_source_file = b.path("src/fuzz_jwt.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const fuzz_jwt_exe = b.addExecutable(.{
+        .name = "fuzz_jwt",
+        .root_module = fuzz_jwt_module,
+    });
+    fuzz_jwt_exe.linkLibC();
+
+    b.installArtifact(fuzz_jwt_exe);
+
+    const fuzz_jwt_run = b.addRunArtifact(fuzz_jwt_exe);
+    if (b.args) |args| {
+        fuzz_jwt_run.addArgs(args);
+    }
+
+    const fuzz_jwt_step = b.step("fuzz-jwt", "Run JWT fuzzing target");
+    fuzz_jwt_step.dependOn(&fuzz_jwt_run.step);
+
+    // --- fuzz_policy ---
+    const fuzz_policy_module = b.createModule(.{
+        .root_source_file = b.path("src/fuzz_policy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const fuzz_policy_exe = b.addExecutable(.{
+        .name = "fuzz_policy",
+        .root_module = fuzz_policy_module,
+    });
+    fuzz_policy_exe.linkLibC();
+
+    b.installArtifact(fuzz_policy_exe);
+
+    const fuzz_policy_run = b.addRunArtifact(fuzz_policy_exe);
+    if (b.args) |args| {
+        fuzz_policy_run.addArgs(args);
+    }
+
+    const fuzz_policy_step = b.step("fuzz-policy", "Run Policy parser fuzzing target");
+    fuzz_policy_step.dependOn(&fuzz_policy_run.step);
 }

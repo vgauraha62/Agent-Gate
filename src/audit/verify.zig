@@ -52,7 +52,7 @@ fn computeEntryHash(entry: *const LogEntry, previous_hash: [16]u8) [16]u8 {
 
 /// Verify hash chain integrity - O(n) operation
 pub fn verifyIntegrity(
-    log: *const anytype,
+    log: anytype,
     public_key: ?[32]u8,
 ) VerifyResult {
     const total_entries = @as(u64, @intCast(@field(log, "sequence")));
@@ -152,7 +152,7 @@ pub fn verifyIntegrity(
 }
 
 /// Quick sanity check - verify only the hash chain, no signatures
-pub fn quickVerify(log: *const anytype) bool {
+pub fn quickVerify(log: anytype) bool {
     const total_entries = @as(u64, @intCast(@field(log, "sequence")));
     if (total_entries == 0) return true;
 
@@ -226,7 +226,6 @@ test "verifyIntegrity: tampered entry fails" {
     // Tamper with entry at sequence 5
     var entry = log.getEntry(5).?;
     entry.agent_id[0] = entry.agent_id[0] ^ 0xFF;  // Flip all bits
-    _ = entry;
 
     // Verification should fail
     const result = verifyIntegrity(&log, signer.publicKey());
@@ -246,7 +245,6 @@ test "verifyIntegrity: modified hash fails" {
     // Tamper with current_hash of entry 6
     var entry = log.getEntry(6).?;
     entry.current_hash[0] = entry.current_hash[0] ^ 0x01;
-    _ = entry;
 
     // Verification should fail at sequence 7 (first to use tampered hash)
     const result = verifyIntegrity(&log, null);
@@ -301,7 +299,6 @@ test "quickVerify: fails for tampered log" {
     // Tamper with an entry
     var entry = log.getEntry(10).?;
     entry.decision = if (entry.decision == 1) 0 else 1;
-    _ = entry;
 
     try std.testing.expect(!quickVerify(&log));
 }

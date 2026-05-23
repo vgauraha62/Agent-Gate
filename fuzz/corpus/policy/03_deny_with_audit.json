@@ -1,0 +1,1 @@
+{"version":"1","policies":[{"path":"/api/admin","allow":[],"deny":[".*"],"require_audit":true}]}

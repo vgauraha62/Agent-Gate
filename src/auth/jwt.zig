@@ -78,13 +78,13 @@ pub const JWT = struct {
         if (part_count != 2) return error.MalformedToken;
         parts[2] = token[last_idx..];
 
-        // Decode header
-        const header_json = try base64UrlDecode(parts[0], arena);
-        const header = try parseHeader(header_json);
+    // Decode header
+    const header_json = try base64UrlDecode(parts[0], arena);
+    const header = try parseHeader(header_json, arena.allocator());
 
-        // Decode payload
-        const payload_json = try base64UrlDecode(parts[1], arena);
-        const payload = try parsePayload(payload_json);
+    // Decode payload
+    const payload_json = try base64UrlDecode(parts[1], arena);
+    const payload = try parsePayload(payload_json, arena.allocator());
 
         // Decode signature
         const signature = try base64UrlDecode(parts[2], arena);
@@ -98,11 +98,15 @@ pub const JWT = struct {
         };
     }
 
-    /// Verify the JWT signature and expiration.
-    pub fn verify(self: *const Self, secret: *Secret) !bool {
-        // Check expiration first
+    /// Verify the JWT signature, expiration, and optional claims.
+    /// `options` controls audience verification and clock skew tolerance.
+    pub fn verify(self: *const Self, secret: *Secret, options: VerifyOptions) !bool {
+        // Check expiration
         try verifyExpiration(self.payload);
-
+        // Check issued-at and not-before constraints
+        try verifyTimeConstraints(self.payload);
+        // Check audience if expected
+        try verifyAudience(self.payload, options.expected_audience);
         // Verify signature using original encoded parts
         return try verifySignature(self.header, self.encoded_header, self.encoded_payload, self.signature, secret);
     }
@@ -219,10 +223,10 @@ fn base64UrlEncode(input: []const u8, allocator: std.mem.Allocator) ![]const u8 
 }
 
 /// Parse header JSON into Header struct.
-/// NOTE: This function uses page_allocator for JSON parsing.
-/// The returned Header strings point to memory that will be freed when
-/// parsed.deinit() is called. For safety, copy the strings if needed after this call.
-fn parseHeader(json_bytes: []const u8) !Header {
+/// The returned Header strings are allocated using `allocator` and must be freed
+/// by the caller (typically via arena reset). JSON parse temporary memory uses
+/// page_allocator and is freed before this function returns.
+fn parseHeader(json_bytes: []const u8, allocator: std.mem.Allocator) !Header {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_bytes, .{});
     defer parsed.deinit();
 
@@ -239,9 +243,9 @@ fn parseHeader(json_bytes: []const u8) !Header {
     else
         return error.InvalidHeader;
 
-    // Allocate owned copies of the strings
-    const alg = try std.heap.page_allocator.dupe(u8, alg_slice);
-    const typ = try std.heap.page_allocator.dupe(u8, typ_slice);
+    // Allocate owned copies of the strings using the caller's allocator
+    const alg = try allocator.dupe(u8, alg_slice);
+    const typ = try allocator.dupe(u8, typ_slice);
 
     return Header{
         .alg = alg,
@@ -250,54 +254,62 @@ fn parseHeader(json_bytes: []const u8) !Header {
 }
 
 /// Parse payload JSON into Payload struct.
-/// NOTE: This function uses page_allocator for JSON parsing.
-/// The returned Payload strings point to memory that will be freed when
-/// parsed.deinit() is called. For safety, copy the strings if needed after this call.
-fn parsePayload(json_bytes: []const u8) !Payload {
+/// The returned Payload strings are allocated using `allocator` and must be freed
+/// by the caller (typically via arena reset). JSON parse temporary memory uses
+/// page_allocator and is freed before this function returns.
+fn parsePayload(json_bytes: []const u8, allocator: std.mem.Allocator) !Payload {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_bytes, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;
 
-    // Required: sub - copy the string slice to prevent use-after-free
+    // --- Phase 1: Extract and validate all values (no allocations) ---
+
+    // Required: sub
     const sub_raw = if (obj.get("sub")) |v|
         if (v == .string) v.string else return error.InvalidPayload
     else
         return error.InvalidPayload;
-    const sub = try std.heap.page_allocator.dupe(u8, sub_raw);
 
-    // Required: exp
+    // Required: exp (validate before allocating sub)
     const exp = if (obj.get("exp")) |v|
         if (v == .integer) v.integer else return error.InvalidPayload
     else
         return error.InvalidPayload;
 
-    // Optional: aud - copy if present
-    var aud: ?[]const u8 = null;
-    if (obj.get("aud")) |v| {
-        if (v == .string) {
-            aud = try std.heap.page_allocator.dupe(u8, v.string);
-        }
-    }
+    // Optional: aud
+    const aud_raw = if (obj.get("aud")) |v|
+        if (v == .string) v.string else null
+    else
+        null;
 
     // Optional: iat
-    var iat: ?u64 = null;
-    if (obj.get("iat")) |v| {
-        if (v == .integer) iat = @intCast(v.integer);
-    }
+    const iat_int = if (obj.get("iat")) |v|
+        if (v == .integer) @as(u64, @intCast(v.integer)) else null
+    else
+        null;
 
     // Optional: nbf
-    var nbf: ?u64 = null;
-    if (obj.get("nbf")) |v| {
-        if (v == .integer) nbf = @intCast(v.integer);
+    const nbf_int = if (obj.get("nbf")) |v|
+        if (v == .integer) @as(u64, @intCast(v.integer)) else null
+    else
+        null;
+
+    // --- Phase 2: Allocate owned copies (all validation succeeded) ---
+
+    const sub = try allocator.dupe(u8, sub_raw);
+
+    var aud: ?[]const u8 = null;
+    if (aud_raw) |a| {
+        aud = try allocator.dupe(u8, a);
     }
 
     return Payload{
         .sub = sub,
         .exp = @intCast(exp),
         .aud = aud,
-        .iat = iat,
-        .nbf = nbf,
+        .iat = iat_int,
+        .nbf = nbf_int,
     };
 }
 
@@ -330,17 +342,17 @@ fn verifySignature(
     var sig_len: usize = 0;
     switch (algo) {
         .sha256 => {
-            const result = hmacSha256(secret.asBytes(), signing_input);
+            const result = try hmacSha256(secret.asBytes(), signing_input);
             @memcpy(expected_sig[0..32], &result);
             sig_len = 32;
         },
         .sha384 => {
-            const result = hmacSha384(secret.asBytes(), signing_input);
+            const result = try hmacSha384(secret.asBytes(), signing_input);
             @memcpy(expected_sig[0..48], &result);
             sig_len = 48;
         },
         .sha512 => {
-            const result = hmacSha512(secret.asBytes(), signing_input);
+            const result = try hmacSha512(secret.asBytes(), signing_input);
             @memcpy(expected_sig[0..64], &result);
             sig_len = 64;
         },
@@ -350,8 +362,10 @@ fn verifySignature(
     return secureCompare(expected_sig[0..sig_len], signature);
 }
 
-/// Manual HMAC-SHA256 implementation - returns fixed-size array
-fn hmacSha256(key: []const u8, message: []const u8) [32]u8 {
+/// Manual HMAC-SHA256 implementation - returns fixed-size array.
+/// Uses heap allocation for inner/outer message buffers to avoid stack overflow
+/// with large messages (the fixed [256]u8 stack buffers previously overflowed).
+fn hmacSha256(key: []const u8, message: []const u8) ![32]u8 {
     const block_size = 64;
     var key_block: [block_size]u8 = .{0} ** block_size;
     var result: [32]u8 = undefined;
@@ -374,24 +388,27 @@ fn hmacSha256(key: []const u8, message: []const u8) [32]u8 {
     }
 
     // Inner hash: H((key ^ ipad) || message)
+    // Use dynamic allocation for inner_msg to support arbitrarily large messages
     var inner: [32]u8 = undefined;
-    var inner_msg: [256]u8 = undefined;
-    const inner_msg_len = block_size + message.len;
+    const inner_msg = try std.heap.page_allocator.alloc(u8, block_size + message.len);
+    defer std.heap.page_allocator.free(inner_msg);
     @memcpy(inner_msg[0..block_size], &ipad);
-    @memcpy(inner_msg[block_size..(block_size + message.len)], message);
-    std.crypto.hash.sha2.Sha256.hash(inner_msg[0..inner_msg_len], &inner, .{});
+    @memcpy(inner_msg[block_size..], message);
+    std.crypto.hash.sha2.Sha256.hash(inner_msg, &inner, .{});
 
     // Outer hash: H((key ^ opad) || inner)
-    var outer_msg: [256]u8 = undefined;
+    const outer_msg = try std.heap.page_allocator.alloc(u8, block_size + 32);
+    defer std.heap.page_allocator.free(outer_msg);
     @memcpy(outer_msg[0..block_size], &opad);
-    @memcpy(outer_msg[block_size..(block_size + 32)], &inner);
-    std.crypto.hash.sha2.Sha256.hash(outer_msg[0..(block_size + 32)], &result, .{});
+    @memcpy(outer_msg[block_size..], &inner);
+    std.crypto.hash.sha2.Sha256.hash(outer_msg, &result, .{});
 
     return result;
 }
 
-/// Manual HMAC-SHA384 implementation - returns fixed-size array
-fn hmacSha384(key: []const u8, message: []const u8) [48]u8 {
+/// Manual HMAC-SHA384 implementation - returns fixed-size array.
+/// Uses heap allocation for inner/outer message buffers to avoid stack overflow.
+fn hmacSha384(key: []const u8, message: []const u8) ![48]u8 {
     const block_size = 128;
     var key_block: [block_size]u8 = .{0} ** block_size;
     var result: [48]u8 = undefined;
@@ -406,30 +423,32 @@ fn hmacSha384(key: []const u8, message: []const u8) [48]u8 {
 
     var ipad: [block_size]u8 = undefined;
     var opad: [block_size]u8 = undefined;
-for (0..block_size) |i| {
+    for (0..block_size) |i| {
         ipad[i] = key_block[i] ^ 0x36;
         opad[i] = key_block[i] ^ 0x5c;
     }
 
-    // Inner hash
+    // Inner hash — dynamic allocation to avoid stack overflow
     var inner: [48]u8 = undefined;
-    var inner_msg: [256]u8 = undefined;
-    const inner_msg_len = block_size + message.len;
+    const inner_msg = try std.heap.page_allocator.alloc(u8, block_size + message.len);
+    defer std.heap.page_allocator.free(inner_msg);
     @memcpy(inner_msg[0..block_size], &ipad);
-    @memcpy(inner_msg[block_size..(block_size + message.len)], message);
-    std.crypto.hash.sha2.Sha384.hash(inner_msg[0..inner_msg_len], &inner, .{});
+    @memcpy(inner_msg[block_size..], message);
+    std.crypto.hash.sha2.Sha384.hash(inner_msg, &inner, .{});
 
-    // Outer hash
-    var outer_msg: [256]u8 = undefined;
+    // Outer hash — dynamic allocation to avoid stack overflow
+    const outer_msg = try std.heap.page_allocator.alloc(u8, block_size + 48);
+    defer std.heap.page_allocator.free(outer_msg);
     @memcpy(outer_msg[0..block_size], &opad);
-    @memcpy(outer_msg[block_size..(block_size + 48)], &inner);
-    std.crypto.hash.sha2.Sha384.hash(outer_msg[0..(block_size + 48)], &result, .{});
+    @memcpy(outer_msg[block_size..], &inner);
+    std.crypto.hash.sha2.Sha384.hash(outer_msg, &result, .{});
 
     return result;
 }
 
-/// Manual HMAC-SHA512 implementation - returns fixed-size array
-fn hmacSha512(key: []const u8, message: []const u8) [64]u8 {
+/// Manual HMAC-SHA512 implementation - returns fixed-size array.
+/// Uses heap allocation for inner/outer message buffers to avoid stack overflow.
+fn hmacSha512(key: []const u8, message: []const u8) ![64]u8 {
     const block_size = 128;
     var key_block: [block_size]u8 = .{0} ** block_size;
     var result: [64]u8 = undefined;
@@ -449,19 +468,20 @@ fn hmacSha512(key: []const u8, message: []const u8) [64]u8 {
         opad[i] = key_block[i] ^ 0x5c;
     }
 
-    // Inner hash
+    // Inner hash — dynamic allocation to avoid stack overflow
     var inner: [64]u8 = undefined;
-    var inner_msg: [256]u8 = undefined;
-    const inner_msg_len = block_size + message.len;
+    const inner_msg = try std.heap.page_allocator.alloc(u8, block_size + message.len);
+    defer std.heap.page_allocator.free(inner_msg);
     @memcpy(inner_msg[0..block_size], &ipad);
-    @memcpy(inner_msg[block_size..(block_size + message.len)], message);
-    std.crypto.hash.sha2.Sha512.hash(inner_msg[0..inner_msg_len], &inner, .{});
+    @memcpy(inner_msg[block_size..], message);
+    std.crypto.hash.sha2.Sha512.hash(inner_msg, &inner, .{});
 
-    // Outer hash
-    var outer_msg: [256]u8 = undefined;
+    // Outer hash — dynamic allocation to avoid stack overflow
+    const outer_msg = try std.heap.page_allocator.alloc(u8, block_size + 64);
+    defer std.heap.page_allocator.free(outer_msg);
     @memcpy(outer_msg[0..block_size], &opad);
-    @memcpy(outer_msg[block_size..(block_size + 64)], &inner);
-    std.crypto.hash.sha2.Sha512.hash(outer_msg[0..(block_size + 64)], &result, .{});
+    @memcpy(outer_msg[block_size..], &inner);
+    std.crypto.hash.sha2.Sha512.hash(outer_msg, &result, .{});
 
     return result;
 }
@@ -471,6 +491,41 @@ fn verifyExpiration(payload: Payload) !void {
     const now = @as(u64, @intCast(std.time.timestamp()));
     if (payload.exp < now) {
         return error.TokenExpired;
+    }
+}
+
+/// Verify issued-at (iat) and not-before (nbf) time constraints.
+/// Allows a 30-second clock skew tolerance.
+pub fn verifyTimeConstraints(payload: Payload) !void {
+    const now = @as(u64, @intCast(std.time.timestamp()));
+    const tolerance = 30; // seconds of clock skew tolerance
+
+    if (payload.iat) |iat| {
+        if (iat > now + tolerance) {
+            return error.TokenNotYetValid;
+        }
+    }
+    if (payload.nbf) |nbf| {
+        if (nbf > now + tolerance) {
+            return error.TokenNotYetValid;
+        }
+    }
+}
+
+/// Verify audience claim.
+/// If `expected` is provided, the token's `aud` claim must match.
+/// If `expected` is null, the check is skipped.
+pub fn verifyAudience(payload: Payload, expected: ?[]const u8) !void {
+    const actual = payload.aud;
+    if (expected) |exp| {
+        if (actual) |act| {
+            if (!std.mem.eql(u8, exp, act)) {
+                return error.InvalidAudience;
+            }
+        } else {
+            // Expected audience but token has none
+            return error.InvalidAudience;
+        }
     }
 }
 
@@ -492,7 +547,16 @@ pub const JwtError = error{
     InvalidPayload,
     InvalidSignature,
     TokenExpired,
+    TokenNotYetValid,
+    InvalidAudience,
     NotImplemented,
+};
+
+/// Options for JWT verification.
+pub const VerifyOptions = struct {
+    /// Expected audience claim. If provided, the token's `aud` claim must match.
+    /// If null, audience verification is skipped.
+    expected_audience: ?[]const u8 = null,
 };
 
 test "JWT Header struct" {
@@ -563,7 +627,9 @@ test "base64UrlDecode empty" {
 
 test "parseHeader valid" {
     const json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
-    const header = try parseHeader(json);
+    const header = try parseHeader(json, std.testing.allocator);
+    defer std.testing.allocator.free(header.alg);
+    defer std.testing.allocator.free(header.typ);
 
     try std.testing.expectEqualStrings("HS256", header.alg);
     try std.testing.expectEqualStrings("JWT", header.typ);
@@ -571,19 +637,23 @@ test "parseHeader valid" {
 
 test "parseHeader missing alg" {
     const json = "{\"typ\":\"JWT\"}";
-    const result = parseHeader(json);
+    const result = parseHeader(json, std.testing.allocator);
     try std.testing.expectError(error.InvalidHeader, result);
 }
 
 test "parseHeader missing typ" {
     const json = "{\"alg\":\"HS256\"}";
-    const result = parseHeader(json);
+    const result = parseHeader(json, std.testing.allocator);
     try std.testing.expectError(error.InvalidHeader, result);
 }
 
 test "parsePayload valid" {
     const json = "{\"sub\":\"agent-123\",\"exp\":9999999999}";
-    const payload = try parsePayload(json);
+    const payload = try parsePayload(json, std.testing.allocator);
+    defer std.testing.allocator.free(payload.sub);
+    if (payload.aud) |a| {
+        defer std.testing.allocator.free(a);
+    }
 
     try std.testing.expectEqualStrings("agent-123", payload.sub);
     try std.testing.expectEqual(@as(u64, 9999999999), payload.exp);
@@ -592,7 +662,11 @@ test "parsePayload valid" {
 
 test "parsePayload with optional fields" {
     const json = "{\"sub\":\"agent-123\",\"exp\":9999999999,\"iat\":1000000000,\"nbf\":1000000000}";
-    const payload = try parsePayload(json);
+    const payload = try parsePayload(json, std.testing.allocator);
+    defer std.testing.allocator.free(payload.sub);
+    if (payload.aud) |a| {
+        defer std.testing.allocator.free(a);
+    }
 
     try std.testing.expectEqualStrings("agent-123", payload.sub);
     try std.testing.expectEqual(@as(u64, 9999999999), payload.exp);
@@ -602,13 +676,13 @@ test "parsePayload with optional fields" {
 
 test "parsePayload missing sub" {
     const json = "{\"exp\":9999999999}";
-    const result = parsePayload(json);
+    const result = parsePayload(json, std.testing.allocator);
     try std.testing.expectError(error.InvalidPayload, result);
 }
 
 test "parsePayload missing exp" {
     const json = "{\"sub\":\"agent-123\"}";
-    const result = parsePayload(json);
+    const result = parsePayload(json, std.testing.allocator);
     try std.testing.expectError(error.InvalidPayload, result);
 }
 
@@ -660,7 +734,7 @@ fn generateTestToken(
     defer allocator.free(signing_input);
 
     // Compute HMAC-SHA256 using the manual implementation
-    const signature = hmacSha256(secret, signing_input);
+    const signature = try hmacSha256(secret, signing_input);
 
     const sig_encoded = try base64UrlEncode(&signature, allocator);
 
@@ -702,8 +776,7 @@ test "JWT full parse and verify - valid token" {
 
     // Parse and verify
     var jwt = try JWT.parse(token, &arena);
-    const valid = try jwt.verify(&secret);
-
+    const valid = try jwt.verify(&secret, .{});
     try std.testing.expect(valid);
     try std.testing.expectEqualStrings("agent-123", jwt.payload.sub);
 }
@@ -723,7 +796,7 @@ test "JWT verify - expired token" {
 
     // Parse and verify should fail
     var jwt = try JWT.parse(token, &arena);
-    const result = jwt.verify(&secret);
+    const result = jwt.verify(&secret, .{});
 
     try std.testing.expectError(error.TokenExpired, result);
 }
@@ -748,7 +821,7 @@ test "JWT verify - wrong secret" {
 
     // Verify with wrong secret should return false (not an error)
     var jwt = try JWT.parse(token, &arena);
-    const valid = try jwt.verify(&wrong_secret);
+    const valid = try jwt.verify(&wrong_secret, .{});
 
     // Signature mismatch returns false, not an error
     try std.testing.expect(!valid);
@@ -815,7 +888,7 @@ test "JWT verify - tampered payload" {
     // Verify should fail
     const result = JWT.parse(tampered, &arena);
     if (result) |jwt| {
-        const verify_result = jwt.verify(&secret);
+        const verify_result = jwt.verify(&secret, .{});
         try std.testing.expectError(error.InvalidSignature, verify_result);
     } else |_| {
         // Parse failure is also acceptable
@@ -830,7 +903,9 @@ test "JWT with HS384 algorithm" {
 
     // Test header parsing with HS384
     const header_json = "{\"alg\":\"HS384\",\"typ\":\"JWT\"}";
-    const header = try parseHeader(header_json);
+    const header = try parseHeader(header_json, std.testing.allocator);
+    defer std.testing.allocator.free(header.alg);
+    defer std.testing.allocator.free(header.typ);
 
     try std.testing.expectEqual(HashAlgorithm.sha384, header.hashAlgorithm());
     try std.testing.expectEqual(@as(usize, 48), HashAlgorithm.sha384.signatureLength());
@@ -843,7 +918,9 @@ test "JWT with HS512 algorithm" {
 
     // Test header parsing with HS512
     const header_json = "{\"alg\":\"HS512\",\"typ\":\"JWT\"}";
-    const header = try parseHeader(header_json);
+    const header = try parseHeader(header_json, std.testing.allocator);
+    defer std.testing.allocator.free(header.alg);
+    defer std.testing.allocator.free(header.typ);
 
     try std.testing.expectEqual(HashAlgorithm.sha512, header.hashAlgorithm());
     try std.testing.expectEqual(@as(usize, 64), HashAlgorithm.sha512.signatureLength());
@@ -864,7 +941,7 @@ test "JWT no memory leaks" {
     while (i < 10) : (i += 1) {
         const token = try generateTestToken(gpa, secret_key, "agent-123", 9999999999);
         var jwt = JWT.parse(token, &arena) catch continue;
-        _ = jwt.verify(&secret) catch continue;
+        _ = jwt.verify(&secret, .{}) catch continue;
         gpa.free(token);
     }
 }
@@ -885,14 +962,14 @@ test "JWT arena reset invalidates token" {
     var jwt = try JWT.parse(token, &arena);
 
     // Verify before reset works
-    try std.testing.expect(try jwt.verify(&secret));
+    try std.testing.expect(try jwt.verify(&secret, .{}));
 
     // Reset arena
     arena.reset();
 
     // After reset, token data is zeroed - verify may fail or succeed depending on timing
     // This demonstrates the security property: arena reset invalidates data
-    _ = jwt.verify(&secret) catch {};
+    _ = jwt.verify(&secret, .{}) catch {};
 }
 
 // ============================================================================
@@ -925,6 +1002,72 @@ pub fn generateExpiredJWT(
     return try generateTestToken(allocator, secret, subject, exp);
 }
 
+/// Claims for token generation.
+pub const TokenClaims = struct {
+    subject: []const u8,
+    expires_at: u64,
+    audience: ?[]const u8 = null,
+    issued_at: ?u64 = null,
+    not_before: ?u64 = null,
+};
+
+/// Generate a JWT token with optional claims (aud, iat, nbf).
+/// Caller owns returned memory — must free with allocator.
+pub fn generateTokenWithClaims(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    claims: TokenClaims,
+) ![]u8 {
+    // Build payload JSON dynamically including optional fields
+    var payload_buf = try std.ArrayList(u8).initCapacity(allocator, 256);
+    defer payload_buf.deinit(allocator);
+
+    const writer = payload_buf.writer(allocator);
+
+    try writer.print("{{\"sub\":\"{s}\",\"exp\":{d}", .{
+        claims.subject,
+        claims.expires_at,
+    });
+
+    if (claims.audience) |a| {
+        try writer.print(",\"aud\":\"{s}\"", .{a});
+    }
+    if (claims.issued_at) |i| {
+        try writer.print(",\"iat\":{d}", .{i});
+    }
+    if (claims.not_before) |n| {
+        try writer.print(",\"nbf\":{d}", .{n});
+    }
+
+    try writer.writeAll("}");
+
+    // Encode and sign
+    const header_json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const header_encoded = try base64UrlEncode(header_json, allocator);
+    defer allocator.free(header_encoded);
+
+    const payload_encoded = try base64UrlEncode(payload_buf.items, allocator);
+    defer allocator.free(payload_encoded);
+
+    const signing_input = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}",
+        .{ header_encoded, payload_encoded },
+    );
+    defer allocator.free(signing_input);
+
+    const signature = try hmacSha256(secret, signing_input);
+    const sig_encoded = try base64UrlEncode(&signature, allocator);
+    defer allocator.free(sig_encoded);
+
+    const total_len = header_encoded.len + 1 + payload_encoded.len + 1 + sig_encoded.len;
+    const result = try allocator.alloc(u8, total_len);
+    const written = try std.fmt.bufPrint(result, "{s}.{s}.{s}", .{
+        header_encoded, payload_encoded, sig_encoded,
+    });
+    return result[0..written.len];
+}
+
 test "generateTestJWT creates valid tokens" {
     const gpa = std.testing.allocator;
     var arena = try SecurityArena.init(gpa, 2048);
@@ -943,7 +1086,7 @@ test "generateTestJWT creates valid tokens" {
     try std.testing.expectEqualStrings("agent-test", jwt.payload.sub);
 
     // Verify it can be verified successfully
-    const valid = try jwt.verify(&sec);
+    const valid = try jwt.verify(&sec, .{});
     try std.testing.expect(valid);
 }
 
@@ -960,7 +1103,7 @@ test "generateExpiredJWT creates expired tokens" {
     defer gpa.free(token);
 
     var jwt = try JWT.parse(token, &arena);
-    const result = jwt.verify(&sec);
+    const result = jwt.verify(&sec, .{});
     try std.testing.expectError(JwtError.TokenExpired, result);
 }
 
@@ -978,8 +1121,10 @@ test "generateTestJWT with different expiration times" {
     defer gpa.free(token);
 
     var jwt = try JWT.parse(token, &arena);
-    try std.testing.expect(try jwt.verify(&sec));
+    try std.testing.expect(try jwt.verify(&sec, .{}));
 
     // Note: Actual expiration timing test skipped as std.time.sleep unavailable
     // The expired token test above covers expiration behavior
 }
+
+

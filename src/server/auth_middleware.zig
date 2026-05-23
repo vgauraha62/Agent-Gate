@@ -94,7 +94,7 @@ pub fn authenticateWithSecret(
     const parsed_jwt = JWT.parse(token, arena) catch return error.InvalidToken;
 
     // Verify with provided secret
-    const valid = JWT.verify(&parsed_jwt, secret) catch |err| {
+    const valid = JWT.verify(&parsed_jwt, secret, .{}) catch |err| {
         // Map JWT errors to Auth errors
         if (err == JwtError.TokenExpired) return error.ExpiredToken;
         if (err == JwtError.InvalidSignature) return error.WrongSecret;
@@ -118,22 +118,6 @@ pub fn authenticateWithSecret(
         .authenticated_at = std.time.timestamp(),
         .permissions = permissions,
     };
-}
-
-/// Legacy function - authenticates with hardcoded secret.
-/// DEPRECATED: Use AuthMiddleware.init() and authenticate() instead.
-pub fn authenticateFromHeader(
-    allocator: std.mem.Allocator,
-    authorization: ?[]const u8,
-) AuthError!Agent {
-    const legacy_secret = "super-secret-key-for-testing";
-    var secret = try Secret.init(allocator, legacy_secret);
-    defer secret.deinit();
-
-    var arena = try SecurityArena.init(allocator, 4096);
-    defer arena.deinit();
-
-    return authenticateWithSecret(&arena, authorization, &secret);
 }
 
 test "AuthMiddleware: init and authenticate with valid token" {

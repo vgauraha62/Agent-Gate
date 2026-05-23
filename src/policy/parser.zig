@@ -257,6 +257,7 @@ fn parseMethodArrayComptime(array: std.json.Array) types.Condition {
     var method_count: usize = 0;
 
     for (array.items) |method_value| {
+        if (method_count >= methods.len) @compileError("too many methods in array (max 10)");
         const method_str = if (method_value == .string) method_value.string else @compileError("Invalid method in array");
         methods[method_count] = parseMethodComptime(method_str);
         method_count += 1;

@@ -7,16 +7,16 @@
 //! - Verification of intact and tampered logs
 
 const std = @import("std");
-const audit_logger = @import("audit/logger.zig");
-const audit_crypto = @import("audit/crypto.zig");
-const audit_verify = @import("audit/verify.zig");
+const audit_logger = @import("logger.zig");
+const audit_crypto = @import("crypto.zig");
+const audit_verify = @import("verify.zig");
 const config = @import("../config.zig");
 
 const AuditLog = audit_logger.AuditLog;
 const AuditSigner = audit_crypto.AuditSigner;
 const verifyIntegrity = audit_verify.verifyIntegrity;
 const quickVerify = audit_verify.quickVerify;
-const Decision = @import("audit/types.zig").Decision;
+const Decision = @import("types.zig").Decision;
 
 test "Integration: Full audit pipeline" {
     // 1. Generate Ed25519 keypair for signing
@@ -62,7 +62,6 @@ test "Integration: Tamper detection - modify entry data" {
     // Tamper with an entry (change decision from allow to deny)
     var entry = log.getEntry(5).?;
     entry.decision = if (entry.decision == 1) 0 else 1;
-    _ = entry;
 
     // Verification should now fail
     result = verifyIntegrity(&log, signer.publicKey());
@@ -90,7 +89,6 @@ test "Integration: Tamper detection - modify hash" {
     // This will cause entry 4's previous_hash to not match
     var entry = log.getEntry(3).?;
     entry.current_hash[0] = entry.current_hash[0] ^ 0xFF;
-    _ = entry;
 
     // Verification should fail
     result = verifyIntegrity(&log, signer.publicKey());
@@ -140,7 +138,6 @@ test "Integration: Quick verify without signatures" {
     // Tamper and quick verify should fail
     var entry = log.getEntry(25).?;
     entry.agent_id[0] = entry.agent_id[0] ^ 0x01;
-    _ = entry;
 
     try std.testing.expect(!quickVerify(&log));
 }
@@ -198,7 +195,6 @@ test "Integration: Multiple checkpoints maintained" {
     log.enableSigning(&signer);
 
     const agent_id = [_]u8{0x9A} ** 32;
-    const CHECKPOINT_INTERVAL = audit_logger.CHECKPOINT_INTERVAL;
 
     // Write enough for multiple checkpoints (256 entries = 2 checkpoints)
     for (0..256) |_| {
