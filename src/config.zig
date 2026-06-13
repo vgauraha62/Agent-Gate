@@ -146,7 +146,7 @@ fn parseExternalPolicy(value: []const u8) EnvParseError!ExternalPolicy {
 // Fields with types not listed here will silently fall through to the
 // UnsupportedType catch-all — add support if the field should be overridable.
 comptime {
-    const sub_configs = [_]type{ ServerConfig, AuthConfig, PolicyConfig, AuditConfig, RequestConfig, ShutdownConfig, TLSConfig };
+    const sub_configs = [_]type{ ServerConfig, AuthConfig, PolicyConfig, AuditConfig, RequestConfig, ShutdownConfig, TLSConfig, ApiConfig };
     for (sub_configs) |SubT| {
         for (std.meta.fields(SubT)) |field| {
             switch (field.type) {
@@ -179,6 +179,7 @@ pub fn applyOverrides(config: *Config, allocator: std.mem.Allocator) void {
     applyOverridesFor(RequestConfig, &config.request, "REQUEST", allocator);
     applyOverridesFor(ShutdownConfig, &config.shutdown, "SHUTDOWN", allocator);
     applyOverridesFor(TLSConfig, &config.tls, "TLS", allocator);
+    applyOverridesFor(ApiConfig, &config.api, "API", allocator);
 }
 
 /// Generic function to apply environment variable overrides to any config struct.
@@ -359,8 +360,8 @@ pub const PolicyConfig = struct {
     /// Maximum policies to evaluate per request.
     max_policies: usize = 1000,
     /// Path to policy JSON file (relative to working directory).
-    /// If null, defaults to "policies/default.json".
-    policy_file: ?[]const u8 = null,
+    /// Defaults to an absolute path inside the container.
+    policy_file: []const u8 = "policies/default.json",
 };
 
 /// Audit configuration.
@@ -389,6 +390,28 @@ pub const ShutdownConfig = struct {
     enable_signals: bool = true,
 };
 
+/// Hosted API mode configuration.
+pub const ApiConfig = struct {
+    /// Enable hosted API mode (API key auth, admin endpoints).
+    enabled: bool = false,
+    /// Master admin API key (if empty, one is generated on first start).
+    admin_key: []const u8 = "",
+    /// Path to store API keys data.
+    storage_path: []const u8 = "/etc/agent-gate/data",
+    /// Default rate limit (requests/second) for new API keys.
+    default_rate_limit: u32 = 100,
+    /// Maximum rate limit per key.
+    max_rate_limit: u32 = 10000,
+    /// Enable rate limiting globally.
+    enable_rate_limiting: bool = true,
+    /// Maximum recent requests to track in memory.
+    max_recent_requests: usize = 10000,
+    /// Enable usage tracking.
+    enable_usage_tracking: bool = true,
+    /// Base URL for the API (used in install script and docs).
+    base_url: []const u8 = "http://localhost:8080",
+};
+
 /// Main configuration struct for AgentGate.
 pub const Config = struct {
     /// Server settings.
@@ -405,6 +428,11 @@ pub const Config = struct {
     shutdown: ShutdownConfig = .{},
     /// TLS/mTLS settings.
     tls: TLSConfig = .{},
+    /// Hosted API mode settings.
+    api: ApiConfig = .{},
+    /// Internal: config file buffer. Set by `load()`, freed by `deinit()`.
+    /// Kept alive because string fields reference into this buffer.
+    _file_buffer: ?[]u8 = null,
 
     const Self = @This();
 
@@ -458,8 +486,10 @@ pub const Config = struct {
     /// so no owned allocations need to be freed here. All string fields
     /// point to either compile-time constants, JSON file memory managed
     /// by the caller, or the process environment block.
-    pub fn deinit(self: *Self) void {
-        _ = self;
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        if (self._file_buffer) |buf| {
+            allocator.free(buf);
+        }
     }
 
     /// Validate the configuration.
@@ -507,7 +537,7 @@ pub const Config = struct {
         defer parsed.deinit();
 
         var config = parsed.value;
-        errdefer config.deinit();
+        errdefer config.deinit(allocator);
 
         // Copy any owned strings if needed
         // For now, we use the parsed values directly
@@ -522,8 +552,9 @@ pub const Config = struct {
         var config = Self.default();
 
         // Try to load from file
-        const file = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch {
-            // File doesn't exist or can't be read - use defaults + env overrides
+        const file = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
+            std.debug.print("[Config] WARNING: Could not read config file '{s}': {}\n", .{ path, err });
+            std.debug.print("[Config] Falling back to defaults + environment overrides\n", .{});
             applyOverrides(&config, allocator);
             return config;
         };
@@ -538,6 +569,8 @@ pub const Config = struct {
 
         // Merge parsed config into our config
         config = parsed.value;
+        // Retain the file buffer — string fields reference into it
+        config._file_buffer = file;
 
         // Apply environment variable overrides (highest priority)
         applyOverrides(&config, allocator);
@@ -639,7 +672,7 @@ test "Config: parse JSON" {
     const json = "{\"server\": {\"port\": 9000}, \"auth\": {\"jwt_secret\": \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\", \"auth_timeout_ms\": 200}}";
 
     var config = try Config.parse(std.testing.allocator, json);
-    defer config.deinit();
+    defer config.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 9000), config.server.port);
     try std.testing.expectEqual(@as(u32, 200), config.auth.auth_timeout_ms);
@@ -733,7 +766,7 @@ test "Config: parse JSON with TLS" {
     const json = "{\"server\": {\"port\": 8080}, \"auth\": {\"jwt_secret\": \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}, \"tls\": {\"mode\": \"native\", \"ca_cert_path\": \"./certs/ca.crt\", \"server_cert_path\": \"./certs/server.crt\", \"server_key_path\": \"./certs/server.key\"}}";
 
     var config = try Config.parse(std.testing.allocator, json);
-    defer config.deinit();
+    defer config.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(true, config.tls.isEnabled());
     try std.testing.expectEqualStrings("./certs/ca.crt", config.tls.ca_cert_path);

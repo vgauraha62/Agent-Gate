@@ -1,0 +1,100 @@
+services:
+  # ============================================================================
+  # AgentGate Cage — AI API Proxy (Go)
+  # Intercepts Anthropic Messages API calls, extracts tool invocations,
+  # checks them against AgentGate policy engine, and forwards allowed requests.
+  #
+  # Upstream: forwards to Ollama running on the HOST (localhost:11434).
+  # Ollama natively supports the Anthropic Messages API — no translation layer needed.
+  #
+  # License: checks with license-server on startup and every 1h.
+  # Without a valid license key, the proxy will NOT start.
+  # ============================================================================
+  proxy:
+    build: ./proxy
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env   # mode-specific: sets ANTHROPIC_URL, LISTEN, AGENTGATE_URL, and defaults
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach the host's Ollama from Docker
+    depends_on:
+      agentgate:
+        condition: service_healthy
+    networks:
+      - agentgate-net
+    restart: unless-stopped
+
+  # ============================================================================
+  # AgentGate Core — Policy Engine (Zig)
+  # Evaluates tool invocations against configurable policies, audit logging,
+  # metrics, and denial tracking.
+  # ============================================================================
+  agentgate:
+    build: .
+    ports:
+      - "8081:8080"   # Policy engine API (internal, accessible from proxy)
+      - "9090:9090"   # Prometheus metrics
+    volumes:
+      - ./config.json:/etc/agent-gate/config.json:ro,z   # mode-agnostic (switch.sh copies the right one)
+      - ./policies:/etc/agent-gate/policies:ro,z
+      - agentgate_data:/etc/agent-gate/data
+    environment:
+      - AGENTGATE_SERVER_PORT=8080
+      - AGENTGATE_SERVER_HOST=0.0.0.0
+      - AGENTGATE_AUTH_JWT_SECRET=${AGENTGATE_JWT_SECRET:-change-me-in-dev-32bytes-secret-key!}
+      - AGENTGATE_POLICY_POLICY_FILE=/etc/agent-gate/policies/ai-agent.json
+    healthcheck:
+      test: ["CMD", "wget", "-q", "http://127.0.0.1:8080/health", "-O", "/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - agentgate-net
+    restart: unless-stopped
+
+  # ============================================================================
+  # License Server — Standalone Go + SQLite
+  # Issues and validates JWT license tokens for the proxy.
+  # Uses RSA-signed tokens bound to machine fingerprints.
+  # ============================================================================
+  license-server:
+    build: ./license-server
+    ports:
+      - "4001:4001"
+    volumes:
+      - ./keys:/etc/agentgate           # mount private.pem for signing
+      - license_data:/var/lib/agentgate  # SQLite database persistence
+    environment:
+      - LISTEN=:4001
+      - DB_PATH=/var/lib/agentgate/license.db
+      - PRIVATE_KEY=/etc/agentgate/private.pem
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-change-me-in-production}
+    networks:
+      - agentgate-net
+    restart: unless-stopped
+
+  # ============================================================================
+  # LiteLLM — API Gateway / Translation Layer
+  # Receives Anthropic Messages API requests from proxy and translates them
+  # to the upstream format (OpenAI for OpenCode, pass-through for Anthropic).
+  # ============================================================================
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: agent-gate-litellm
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro,z
+    entrypoint: ["litellm", "--config", "/app/config.yaml", "--port", "4000"]
+    networks:
+      - agentgate-net
+    restart: unless-stopped
+
+networks:
+  agentgate-net:
+    driver: bridge
+
+volumes:
+  agentgate_data:
+  license_data:

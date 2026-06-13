@@ -1,0 +1,23 @@
+Here are the commands to run the benchmark:
+1. Build Everything
+cd /home/gauraha/zig/agent-gate
+zig build -Doptimize=ReleaseFast
+2. Start Server (Terminal 1)
+cd /home/gauraha/zig/agent-gate
+JWT_SECRET="agent-gate-default-secret-32bytes!" ./zig-out/bin/agent-gate
+3. Run Benchmark (Terminal 2)
+cd /home/gauraha/zig/agent-gate
+./zig-out/bin/loadtest --workers 10 --requests 1000 --no-spawn
+Alternative: Run Both via Script
+cd /home/gauraha/zig/agent-gate
+# Terminal 1: Start server
+JWT_SECRET="agent-gate-default-secret-32bytes!" ./zig-out/bin/agent-gate &
+# Wait for server
+sleep 3
+# Terminal 2: Run benchmark
+./zig-out/bin/loadtest --workers 10 --requests 1000 --no-spawn
+# Cleanup
+pkill agent-gate
+Quick Test (minimal)
+cd /home/gauraha/zig/agent-gate
+zig build benchmark -Doptimize=ReleaseFast 2>&1 | tail -20

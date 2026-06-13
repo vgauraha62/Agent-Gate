@@ -1,0 +1,32 @@
+# =============================================================================
+# LiteLLM Configuration — Claude Code Mode
+#
+# Routes requests to Anthropic API for Claude models.
+# In this mode, the proxy talks directly to Ollama (bypassing LiteLLM),
+# so this config is only used if someone connects to LiteLLM manually
+# with Anthropic API key.
+# =============================================================================
+
+model_list:
+  # ── Anthropic / Claude models ───────────────────────────────────────
+  - model_name: "claude-*"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-20250514"
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: "claude-sonnet-4-*"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-20250514"
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+# ── LiteLLM Engine Settings ──────────────────────────────────────────
+litellm_settings:
+  drop_params: true
+  set_verbose: true
+  accept_anthropic_format: true
+
+# ── General Settings ─────────────────────────────────────────────────
+general_settings:
+  master_key: sk-litellm-master-key
+  enable_telemetry: false
+  allow_requests_on_db_unavailable: true

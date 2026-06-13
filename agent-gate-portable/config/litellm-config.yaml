@@ -1,0 +1,54 @@
+# =============================================================================
+# LiteLLM Configuration Template — Dual-Mode API Gateway
+#
+# Routes requests to the correct upstream based on the model name:
+#   - Claude models  → Anthropic API (passthrough, same format)
+#   - OpenCode models → OpenCode API (translated from Anthropic to OpenAI format)
+#
+# ⚠️  Replace YOUR_ZEN_API_KEY_HERE with your actual Zen API key.
+#     Get one at: https://opencode.ai
+# =============================================================================
+
+model_list:
+  # ── Anthropic / Claude models ───────────────────────────────────────
+  # Proxy sends Anthropic Messages API format; LiteLLM passes through.
+  - model_name: "claude-*"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-20250514"
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: "claude-sonnet-4-*"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-20250514"
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # ── OpenCode / DeepSeek models ──────────────────────────────────────
+  # Proxy sends Anthropic format; LiteLLM translates to OpenAI format.
+  - model_name: "DeepSeek V4 Flash Free"
+    litellm_params:
+      model: "openai/deepseek-v4-flash-free"
+      api_base: https://opencode.ai/zen/v1
+      api_key: YOUR_ZEN_API_KEY_HERE
+
+  - model_name: "deepseek-*"
+    litellm_params:
+      model: "openai/deepseek-v4-flash"
+      api_base: https://opencode.ai/zen/v1
+      api_key: YOUR_ZEN_API_KEY_HERE
+
+  # ── Ollama (local) models ───────────────────────────────────────────
+  - model_name: "ollama-*"
+    litellm_params:
+      model: "openai/ollama"
+      api_base: http://host.docker.internal:11434
+
+# ── LiteLLM Engine Settings ──────────────────────────────────────────
+litellm_settings:
+  drop_params: true
+  set_verbose: true
+  accept_anthropic_format: true
+
+# ── General Settings ─────────────────────────────────────────────────
+general_settings:
+  master_key: sk-litellm-master-key
+  enable_telemetry: false

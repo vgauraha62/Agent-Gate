@@ -1,0 +1,65 @@
+{
+  "version": "1",
+  "policies": [
+    {
+      "id": "allow-authenticated",
+      "effect": "allow",
+      "match": {
+        "agent_id": "auth-service",
+        "path": "/api/auth/*",
+        "method": ["GET", "POST"]
+      }
+    },
+    {
+      "id": "allow-user-read",
+      "effect": "allow",
+      "match": {
+        "agent_id": "*",
+        "path": "/api/users/*",
+        "method": "GET"
+      }
+    },
+    {
+      "id": "allow-user-write",
+      "effect": "allow",
+      "match": {
+        "agent_id": "user-service",
+        "path": "/api/users/*",
+        "method": ["POST", "PUT", "PATCH"]
+      }
+    },
+    {
+      "id": "allow-admin-all",
+      "effect": "allow",
+      "match": {
+        "agent_id": "admin-service",
+        "path": "/api/*"
+      }
+    },
+    {
+      "id": "deny-admin-delete",
+      "effect": "deny",
+      "match": {
+        "agent_id": "*",
+        "path": "/api/admin/*",
+        "method": "DELETE"
+      }
+    },
+    {
+      "id": "allow-metrics",
+      "effect": "allow",
+      "match": {
+        "path": "/metrics",
+        "method": "GET"
+      }
+    },
+    {
+      "id": "deny-default",
+      "effect": "deny",
+      "match": {
+        "agent_id": "*",
+        "path": "*"
+      }
+    }
+  ]
+}

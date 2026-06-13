@@ -1,0 +1,32 @@
+# =============================================================================
+# LiteLLM Configuration — OpenCode Mode
+#
+# Routes requests to OpenCode's Zen API for DeepSeek models.
+# Proxy sends Anthropic Messages API format; LiteLLM translates to OpenAI format.
+# =============================================================================
+
+model_list:
+  # ── OpenCode / DeepSeek models ──────────────────────────────────────
+  - model_name: "agentgate/deepseek-v4-flash-free"
+    litellm_params:
+      model: "openai/deepseek-v4-flash-free"
+      api_base: https://opencode.ai/zen/v1
+      api_key: sk-PQmX0Hx6yeqEgopEEdFyk4G2T3AI3R8Q5zrnFg9upoCk3Zfc97aflx1gnbE6kALj
+
+  - model_name: "agentgate/deepseek-v4-flash"
+    litellm_params:
+      model: "openai/deepseek-v4-flash"
+      api_base: https://opencode.ai/zen/v1
+      api_key: sk-PQmX0Hx6yeqEgopEEdFyk4G2T3AI3R8Q5zrnFg9upoCk3Zfc97aflx1gnbE6kALj
+
+# ── LiteLLM Engine Settings ──────────────────────────────────────────
+litellm_settings:
+  drop_params: true
+  set_verbose: true
+  accept_anthropic_format: true
+
+# ── General Settings ─────────────────────────────────────────────────
+general_settings:
+  master_key: sk-litellm-master-key
+  enable_telemetry: false
+  allow_requests_on_db_unavailable: true

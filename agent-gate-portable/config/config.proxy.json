@@ -1,0 +1,32 @@
+{
+  "server": {
+    "port": 8081,
+    "host": "0.0.0.0",
+    "workers": 4
+  },
+  "auth": {
+    "jwt_secret": "change-me-in-dev-32bytes-secret-key-here!",
+    "auth_timeout_ms": 100
+  },
+  "policy": {
+    "policy_timeout_ms": 20,
+    "max_policies": 100,
+    "policy_file": "/etc/agent-gate/policies/ai-agent.json"
+  },
+  "audit": {
+    "buffer_size": 1024,
+    "audit_timeout_ms": 10
+  },
+  "request": {
+    "request_timeout_ms": 10000,
+    "max_body_size": 1048576,
+    "max_headers": 64
+  },
+  "shutdown": {
+    "grace_period_ms": 30000,
+    "enable_signals": true
+  },
+  "tls": {
+    "mode": "disabled"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "server": { "port": 8080, "host": "0.0.0.0" },
+  "policy": { "policy_file": "policies/default.json" },
+  "timeouts": { "policy_ms": 20, "request_ms": 10000 },
+  "auth": { "jwt_secret": "change-me-in-dev-32bytes-secret-key!" },
+  "tls": { "mode": "disabled" }
+}

@@ -1,0 +1,43 @@
+{
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0",
+    "workers": 4
+  },
+  "auth": {
+    "jwt_secret": "change-me-in-production-0123456789",
+    "auth_timeout_ms": 100
+  },
+  "request": {
+    "request_timeout_ms": 5000,
+    "max_body_size": 65536,
+    "max_headers": 64
+  },
+  "policy": {
+    "policy_timeout_ms": 50,
+    "max_policies": 1000,
+    "policy_file": "/etc/agent-gate/policies/default.json"
+  },
+  "audit": {
+    "buffer_size": 1024,
+    "audit_timeout_ms": 10
+  },
+  "shutdown": {
+    "grace_period_ms": 30000,
+    "enable_signals": true
+  },
+  "tls": {
+    "mode": "disabled"
+  },
+  "api": {
+    "enabled": true,
+    "admin_key": "",
+    "storage_path": "/etc/agent-gate/data",
+    "default_rate_limit": 100,
+    "max_rate_limit": 10000,
+    "enable_rate_limiting": true,
+    "max_recent_requests": 10000,
+    "enable_usage_tracking": true,
+    "base_url": "http://localhost:8080"
+  }
+}

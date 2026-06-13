@@ -1,0 +1,18 @@
+{
+  "version": "1",
+  "policies": [
+    { "id": "block-rm-rf", "effect": "deny", "match": { "tool": "bash", "command_pattern": "rm -rf" } },
+    { "id": "block-env-access", "effect": "deny", "match": { "command_pattern": ".env" } },
+    { "id": "block-passwd", "effect": "deny", "match": { "tool": "bash", "command_pattern": "/etc/passwd" } },
+    { "id": "block-ssh-keys", "effect": "deny", "match": { "tool": "read", "path_pattern": "~/.ssh/" } },
+    { "id": "block-aws-creds", "effect": "deny", "match": { "tool": "read", "path_pattern": "~/.aws/" } },
+    { "id": "block-home-read", "effect": "deny", "match": { "tool": "read", "path_pattern": "/home/" } },
+    { "id": "block-write-sensitive", "effect": "deny", "match": { "tool": "write", "path_pattern": "/etc/" } },
+    { "id": "block-edit-etc", "effect": "deny", "match": { "tool": "edit", "path_pattern": "/etc/" } },
+    { "id": "allow-bash", "effect": "allow", "match": { "tool": "bash" } },
+    { "id": "allow-read-workspace", "effect": "allow", "match": { "tool_pattern": "read_*", "path_pattern": "/workspace/*" } },
+    { "id": "allow-read", "effect": "allow", "match": { "tool": "read", "path_pattern": "/workspace/*" } },
+    { "id": "allow-write-workspace", "effect": "allow", "match": { "tool": "write", "path_pattern": "/workspace/*" } },
+    { "id": "allow-edit-workspace", "effect": "allow", "match": { "tool": "edit", "path_pattern": "/workspace/*" } }
+  ]
+}

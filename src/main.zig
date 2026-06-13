@@ -7,6 +7,9 @@ const types = @import("policy/types.zig");
 const parser = @import("policy/parser.zig");
 const Memory = @import("memory.zig");
 const denial_tracker = @import("denial_tracker.zig");
+const apikey = @import("apikey.zig");
+const usage = @import("usage.zig");
+const hosted = @import("hosted.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -47,11 +50,17 @@ pub fn main() !void {
         std.debug.print("[Startup] Loading configuration from {s}\n", .{path});
         config = try Config.Config.load(path, allocator);
     } else {
-        // Use defaults + env overrides
-        config = Config.Config.default();
-        Config.applyOverrides(&config, allocator);
+        // Auto-discover config.json from current working directory
+        if (std.fs.cwd().access("config.json", .{})) {
+            config = try Config.Config.load("config.json", allocator);
+            std.debug.print("[Startup] Loading configuration from config.json (auto-discovered)\n", .{});
+        } else |_| {
+            // Fall back to defaults + env overrides
+            config = Config.Config.default();
+            Config.applyOverrides(&config, allocator);
+        }
     }
-    defer config.deinit();
+    defer config.deinit(allocator);
 
     // Validate configuration
     config.validate() catch |err| {
@@ -71,8 +80,72 @@ pub fn main() !void {
     try denial_tracker.initGlobal(allocator);
     defer denial_tracker.deinitGlobal();
 
+    // ========================================================================
+    // Hosted API Mode Initialization
+    // ========================================================================
+    var key_store: ?apikey.ApiKeyStore = null;
+    var usage_tracker: ?usage.UsageTracker = null;
+    var hosted_ctx: ?hosted.HostedContext = null;
+
+    if (config.api.enabled) {
+        std.debug.print("[Startup] Hosted API mode enabled\n", .{});
+
+        // Initialize API key store
+        const storage_path = if (config.api.storage_path.len > 0)
+            config.api.storage_path
+        else
+            "/etc/agent-gate/data";
+
+        // Ensure storage directory exists
+        std.fs.cwd().makePath(storage_path) catch {};
+        std.debug.print("[Startup] API key storage: {s}\n", .{storage_path});
+
+        key_store = apikey.ApiKeyStore.init(allocator, storage_path) catch |err| {
+            std.debug.print("[Startup] Failed to init API key store: {}\n", .{err});
+            return err;
+        };
+
+        // Initialize usage tracker
+        usage_tracker = usage.UsageTracker.init(allocator, config.api.max_recent_requests);
+        usage_tracker.?.rate_limiting_enabled = config.api.enable_rate_limiting;
+        usage_tracker.?.enabled = config.api.enable_usage_tracking;
+
+        // Initialize hosted context
+        if (key_store) |*ks| {
+            if (usage_tracker) |*ut| {
+                hosted_ctx = hosted.HostedContext.init(allocator, &config.api, ks, ut);
+
+                // Generate admin key if not configured
+                if (config.api.admin_key.len == 0) {
+                    std.debug.print("[Startup] No admin key configured, generating one...\n", .{});
+                    // Note: admin key is printed once to stdout on startup
+                    // Users should save it and set it explicitly in config for persistence
+                    const admin_key = try std.fmt.allocPrint(allocator, "ag_admin_{s}", .{
+                        @as([]const u8, try generateRandomString(allocator, 24)),
+                    });
+                    // Can't modify config.api.admin_key since it's a const pointer, so we store
+                    // it separately. For simplicity, we'll update the ApiConfig struct directly.
+                    // Since config is var, we can modify its api field
+                    config.api.admin_key = admin_key;
+                    std.debug.print("\n", .{});
+                    std.debug.print("╔══════════════════════════════════════════════════╗\n", .{});
+                    std.debug.print("║       ADMIN API KEY (save this securely!)       ║\n", .{});
+                    std.debug.print("╠══════════════════════════════════════════════════╣\n", .{});
+                    std.debug.print("║  {s}\n", .{admin_key});
+                    std.debug.print("╚══════════════════════════════════════════════════╝\n", .{});
+                    std.debug.print("\n", .{});
+                    std.debug.print("[Startup] Set AGENTGATE_API_ADMIN_KEY env var to reuse this key across restarts\n", .{});
+                }
+
+                std.debug.print("[Startup] Hosted API ready at {s}\n", .{config.api.base_url});
+                std.debug.print("[Startup] Admin endpoints: {s}/v1/admin/keys\n", .{config.api.base_url});
+                std.debug.print("[Startup] Default rate limit: {} req/s\n", .{config.api.default_rate_limit});
+            }
+        }
+    }
+
     // Load policies from JSON file
-    const policy_file_path = config.policy.policy_file orelse "policies/default.json";
+    const policy_file_path = config.policy.policy_file;
     std.debug.print("[Startup] Loading policies from: {s}\n", .{policy_file_path});
 
     var policy_arena = try Memory.SecurityArena.init(allocator, 65536);
@@ -104,6 +177,11 @@ pub fn main() !void {
         );
         defer server.deinit();
 
+        // Pass hosted context if available
+        if (hosted_ctx) |*hctx| {
+            server.setHostedContext(hctx);
+        }
+
         std.debug.print("[Startup] Starting async HTTP server on port {d}...\n", .{config.server.port});
         try server.run();
     } else {
@@ -125,6 +203,25 @@ pub fn main() !void {
         );
         defer server.deinit();
 
+        // Pass hosted context if available
+        if (hosted_ctx) |*hctx| {
+            server.setHostedContext(hctx);
+        }
+
         try server.run();
     }
+}
+
+/// Generate a cryptographically random alphanumeric string of the given length.
+fn generateRandomString(allocator: std.mem.Allocator, len: usize) ![]const u8 {
+    const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+    var buf = try allocator.alloc(u8, len);
+    const random_bytes = try allocator.alloc(u8, len);
+    defer allocator.free(random_bytes);
+
+    std.crypto.random.bytes(random_bytes);
+    for (buf, 0..) |_, i| {
+        buf[i] = chars[@as(usize, @intCast(random_bytes[i] % chars.len))];
+    }
+    return buf;
 }

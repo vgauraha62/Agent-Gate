@@ -42,3 +42,10 @@ graphify-out/
 
 # Local config with secrets (never commit)
 config.json
+
+# License server RSA private key (never commit)
+keys/
+
+# Environment secrets (never commit)
+.env
+

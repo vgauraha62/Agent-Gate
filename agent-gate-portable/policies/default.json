@@ -1,0 +1,9 @@
+{
+  "version": "1",
+  "policies": [
+    { "id": "allow-api", "effect": "allow", "match": { "path": "/api/*" } },
+    { "id": "deny-admin", "effect": "deny", "match": { "path": "/admin/*" } },
+    { "id": "deny-secret", "effect": "deny", "match": { "path": "/secret/*" } },
+    { "id": "deny-system", "effect": "deny", "match": { "path": "/system/*" } }
+  ]
+}

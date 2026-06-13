@@ -1,0 +1,7 @@
+=== AgentGate Baseline Benchmark ===
+Config: 8 workers, 1000 requests
+Target: http://127.0.0.1:8080
+Waiting for server to be ready...
+Server is ready!
+
+Running benchmark...

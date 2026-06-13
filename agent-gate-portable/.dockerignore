@@ -1,0 +1,34 @@
+# Git
+.git/
+.gitignore
+
+# Zig build artifacts
+.zig-cache/
+zig-out/
+dependencies/
+
+# Local config with secrets (never include in image)
+config.json
+
+# Development & documentation
+docs/
+scripts/
+*.md
+task_plan.md
+findings.md
+progress.md
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Certificates — mount as volumes at runtime
+certs/
+
+# Analysis files
+*_summary.txt
+analysis_*.md
+commands.txt
