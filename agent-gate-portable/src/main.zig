@@ -50,11 +50,17 @@ pub fn main() !void {
         std.debug.print("[Startup] Loading configuration from {s}\n", .{path});
         config = try Config.Config.load(path, allocator);
     } else {
-        // Use defaults + env overrides
-        config = Config.Config.default();
-        Config.applyOverrides(&config, allocator);
+        // Auto-discover config.json from current working directory
+        if (std.fs.cwd().access("config.json", .{})) {
+            config = try Config.Config.load("config.json", allocator);
+            std.debug.print("[Startup] Loading configuration from config.json (auto-discovered)\n", .{});
+        } else |_| {
+            // Fall back to defaults + env overrides
+            config = Config.Config.default();
+            Config.applyOverrides(&config, allocator);
+        }
     }
-    defer config.deinit();
+    defer config.deinit(allocator);
 
     // Validate configuration
     config.validate() catch |err| {
@@ -142,7 +148,8 @@ pub fn main() !void {
     const policy_file_path = config.policy.policy_file;
     std.debug.print("[Startup] Loading policies from: {s}\n", .{policy_file_path});
 
-    var policy_arena = try Memory.SecurityArena.init(allocator, 65536);
+    // ponytail: 256KB fits ~200 policies at current ~1KB each; grow if policy count nears max_policies.
+    var policy_arena = try Memory.SecurityArena.init(allocator, 262144);
     defer policy_arena.deinit();
 
     const policy_json = std.fs.cwd().readFileAlloc(allocator, policy_file_path, 1024 * 1024) catch |err| {

@@ -77,3 +77,51 @@ type ToolChoice struct {
 	Type string `json:"type"`
 	Name string `json:"name,omitempty"`
 }
+
+// ── SSE Streaming Types ─────────────────────────────────────────────────────
+
+// SSEEvent represents a single Server-Sent Event from the Anthropic API.
+type SSEEvent struct {
+	Event string          // The event type from the "event:" line
+	Data  json.RawMessage // The JSON data from the "data:" line
+}
+
+// ContentBlockStartData is the data payload for content_block_start events.
+type ContentBlockStartData struct {
+	Index        int             `json:"index"`
+	ContentBlock ContentBlock    `json:"content_block"`
+}
+
+// ContentBlockDeltaData is the data payload for content_block_delta events.
+type ContentBlockDeltaData struct {
+	Index int         `json:"index"`
+	Delta DeltaBlock  `json:"delta"`
+}
+
+// DeltaBlock represents the delta field in content_block_delta events.
+type DeltaBlock struct {
+	Type        string `json:"type"`
+	Text        string `json:"text,omitempty"`
+	PartialJSON string `json:"partial_json,omitempty"`
+}
+
+// ContentBlockStopData is the data payload for content_block_stop events.
+type ContentBlockStopData struct {
+	Index int `json:"index"`
+}
+
+// MessagesResponse is the non-streaming response body from the Anthropic API.
+type MessagesResponse struct {
+	ID      string         `json:"id"`
+	Type    string         `json:"type"`
+	Role    string         `json:"role"`
+	Content []ContentBlock `json:"content"`
+	Model   string         `json:"model"`
+	Usage   *UsageInfo     `json:"usage,omitempty"`
+}
+
+// UsageInfo contains token usage information.
+type UsageInfo struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}

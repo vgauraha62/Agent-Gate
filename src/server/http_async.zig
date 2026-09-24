@@ -377,38 +377,14 @@ pub const Server = struct {
     fn sendMetrics(self: *Self, fd: c_int, buffer: []u8) void {
         _ = buffer; // Not used in this simplified implementation
         const metrics = prometheus.global_metrics.exportMetrics();
-        
-        // Simple approach: write parts separately to avoid any buffer issues
-        const header1 = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ";
-        _ = c.write(fd, header1, header1.len);
-        
-        // Write content-length as string manually
+
+        // ponytail: bufPrint over manual int->string, same output
         var len_buf: [16]u8 = undefined;
-        var len_pos: usize = 0;
-        var mlen = metrics.len;
-        if (mlen == 0) {
-            len_buf[0] = '0';
-            len_pos = 1;
-        } else {
-            while (mlen > 0) {
-                len_buf[len_pos] = '0' + @as(u8, @intCast(mlen % 10));
-                len_pos += 1;
-                mlen /= 10;
-            }
-        }
-        // Reverse
-        var i: usize = 0;
-        while (i < len_pos / 2) {
-            const tmp = len_buf[i];
-            len_buf[i] = len_buf[len_pos - 1 - i];
-            len_buf[len_pos - 1 - i] = tmp;
-            i += 1;
-        }
-        _ = c.write(fd, &len_buf, len_pos);
-        
-        const header2 = "\r\n\r\n";
-        _ = c.write(fd, header2, header2.len);
-        
+        const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{metrics.len}) catch "0";
+        var hdr_buf: [128]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {s}\r\n\r\n", .{len_str}) catch return;
+        _ = c.write(fd, hdr.ptr, hdr.len);
+
         // Write metrics
         _ = c.write(fd, metrics.ptr, metrics.len);
         

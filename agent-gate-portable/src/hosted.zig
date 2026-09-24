@@ -96,7 +96,7 @@ pub const HostedContext = struct {
             .latency_us = latency_us,
         };
 
-        _ = self.usage_tracker.recordAndCheck(hash, 0, record);
+        _ = self.usage_tracker.recordAndCheck(hash, 0, record, null);
     }
 };
 

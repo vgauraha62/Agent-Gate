@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const crypto = std.crypto;
+const jwtSecureCompare = @import("auth/jwt.zig").secureCompare;
 
 // ============================================================================
 // Constants
@@ -102,17 +103,7 @@ pub const ApiKeyEntry = struct {
     pub fn matchesKey(self: *const Self, key: []const u8) bool {
         var key_hash: [32]u8 = undefined;
         crypto.hash.sha2.Sha256.hash(key, &key_hash, .{});
-        return secureCompare(&key_hash, &self.hash);
-    }
-
-    /// Constant-time byte comparison.
-    fn secureCompare(a: []const u8, b: []const u8) bool {
-        if (a.len != b.len) return false;
-        var result: u8 = 0;
-        for (a, 0..) |byte, i| {
-            result |= byte ^ b[i];
-        }
-        return result == 0;
+        return jwtSecureCompare(&key_hash, &self.hash);
     }
 
     /// Check if key is active and not expired.

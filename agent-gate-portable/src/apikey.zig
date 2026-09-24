@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const crypto = std.crypto;
+const jwtSecureCompare = @import("auth/jwt.zig").secureCompare;
 
 // ============================================================================
 // Constants
@@ -18,7 +19,7 @@ pub const KEY_PREFIX: []const u8 = "ag_";
 /// Length of the random portion in bytes (before encoding).
 pub const RANDOM_BYTES: usize = 32;
 /// Total key length: prefix (3) + base62 encoded random (43) = 46 chars
-pub const KEY_TOTAL_LENGTH: usize = KEY_PREFIX.len + 46;
+pub const KEY_TOTAL_LENGTH: usize = KEY_PREFIX.len + 43;
 /// Default max keys per admin
 pub const MAX_KEYS_PER_ADMIN: usize = 1000;
 /// Default rate limit (requests per second) per key
@@ -102,17 +103,7 @@ pub const ApiKeyEntry = struct {
     pub fn matchesKey(self: *const Self, key: []const u8) bool {
         var key_hash: [32]u8 = undefined;
         crypto.hash.sha2.Sha256.hash(key, &key_hash, .{});
-        return secureCompare(&key_hash, &self.hash);
-    }
-
-    /// Constant-time byte comparison.
-    fn secureCompare(a: []const u8, b: []const u8) bool {
-        if (a.len != b.len) return false;
-        var result: u8 = 0;
-        for (a, 0..) |byte, i| {
-            result |= byte ^ b[i];
-        }
-        return result == 0;
+        return jwtSecureCompare(&key_hash, &self.hash);
     }
 
     /// Check if key is active and not expired.
@@ -517,7 +508,9 @@ test "ApiKey: persist and reload" {
         var store = try ApiKeyStore.init(allocator, tmp_path);
         defer store.deinit();
         const k = try store.createKey("persist-test", 50, 0, "");
-        break :blk try allocator.dupe(u8, k);
+        const duped = try allocator.dupe(u8, k);
+        allocator.free(k); // Free the original allocation from createKey
+        break :blk duped;
     };
     defer allocator.free(key);
 

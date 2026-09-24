@@ -57,122 +57,31 @@ const server = b.addModule("server", .{ .root_source_file = b.path("src/server/h
     const run_step = b.step("run", "Run the agent-gate");
     run_step.dependOn(&run_cmd.step);
 
-    // Unit tests module
-    const test_module = b.createModule(.{
-        .root_source_file = b.path("src/test_integration.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const test_obj = b.addTest(.{
-        .root_module = test_module,
-    });
-
-    const test_step = b.step("test", "Run unit tests");
-    const test_run = b.addRunArtifact(test_obj);
-    test_step.dependOn(&test_run.step);
-
-    // E2E Integration tests module
-    const e2e_module = b.createModule(.{
-        .root_source_file = b.path("src/integration_e2e_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const e2e_obj = b.addTest(.{
-        .root_module = e2e_module,
-    });
-
-    const e2e_step = b.step("test-e2e", "Run E2E integration tests");
-    const e2e_run = b.addRunArtifact(e2e_obj);
-    e2e_step.dependOn(&e2e_run.step);
-
-    // E2E Server tests module
-    const e2e_server_module = b.createModule(.{
-        .root_source_file = b.path("src/e2e_server_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const e2e_server_obj = b.addTest(.{
-        .root_module = e2e_server_module,
-    });
-
-    const e2e_server_step = b.step("test-e2e-server", "Run E2E server tests");
-    const e2e_server_run = b.addRunArtifact(e2e_server_obj);
-    e2e_server_step.dependOn(&e2e_server_run.step);
-
-    // Config integration tests module
-    const config_test_module = b.createModule(.{
-        .root_source_file = b.path("src/config_integration_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const config_test_obj = b.addTest(.{
-        .root_module = config_test_module,
-    });
-
-    const config_test_step = b.step("test-config", "Run config integration tests");
-    const config_test_run = b.addRunArtifact(config_test_obj);
-    config_test_step.dependOn(&config_test_run.step);
-
-    // Security integration tests (formerly orphaned — src/integration_test.zig)
-    const security_test_module = b.createModule(.{
-        .root_source_file = b.path("src/integration_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const security_test_obj = b.addTest(.{
-        .root_module = security_test_module,
-    });
-
-    const security_test_step = b.step("test-security", "Run SecurityArena/Secret/Agent integration tests");
-    const security_test_run = b.addRunArtifact(security_test_obj);
-    security_test_step.dependOn(&security_test_run.step);
-
-    // Audit integration tests (formerly orphaned — src/audit/integration_test.zig).
-    // Uses wrapper at src/ level so module root = src/, allowing @import("../config.zig")
-    // in src/audit/ files to resolve within the module path.
-    const audit_test_module = b.createModule(.{
-        .root_source_file = b.path("src/audit_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const audit_test_obj = b.addTest(.{
-        .root_module = audit_test_module,
-    });
-
-    const audit_test_step = b.step("test-audit", "Run audit log integrity integration tests");
-    const audit_test_run = b.addRunArtifact(audit_test_obj);
-    audit_test_step.dependOn(&audit_test_run.step);
-
-    // Gap coverage tests (edge cases not covered by existing unit/integration tests)
-    const gap_test_module = b.createModule(.{
-        .root_source_file = b.path("src/gap_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const gap_test_obj = b.addTest(.{
-        .root_module = gap_test_module,
-    });
-
-    const gap_test_step = b.step("test-gaps", "Run coverage gap tests (edge cases, boundary conditions)");
-    const gap_test_run = b.addRunArtifact(gap_test_obj);
-    gap_test_step.dependOn(&gap_test_run.step);
-
+    // ponytail: one helper over 7 copy-pasted test stanzas
+    const TestSuite = struct { step_name: []const u8, desc: []const u8, src: []const u8 };
+    const suites = [_]TestSuite{
+        .{ .step_name = "test", .desc = "Run unit tests", .src = "src/test_integration.zig" },
+        .{ .step_name = "test-e2e", .desc = "Run E2E integration tests", .src = "src/integration_e2e_test.zig" },
+        .{ .step_name = "test-e2e-server", .desc = "Run E2E server tests", .src = "src/e2e_server_test.zig" },
+        .{ .step_name = "test-config", .desc = "Run config integration tests", .src = "src/config_integration_test.zig" },
+        .{ .step_name = "test-security", .desc = "Run SecurityArena/Secret/Agent integration tests", .src = "src/integration_test.zig" },
+        .{ .step_name = "test-audit", .desc = "Run audit log integrity integration tests", .src = "src/audit_tests.zig" },
+        .{ .step_name = "test-gaps", .desc = "Run coverage gap tests (edge cases, boundary conditions)", .src = "src/gap_test.zig" },
+    };
     // Combined test step
     const all_tests_step = b.step("test-all", "Run all tests (unit + E2E + config + security + audit + gaps)");
-    all_tests_step.dependOn(&test_run.step);
-    all_tests_step.dependOn(&e2e_run.step);
-    all_tests_step.dependOn(&e2e_server_run.step);
-    all_tests_step.dependOn(&config_test_run.step);
-    all_tests_step.dependOn(&security_test_run.step);
-    all_tests_step.dependOn(&audit_test_run.step);
-    all_tests_step.dependOn(&gap_test_run.step);
+    inline for (suites) |s| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(s.src),
+            .target = target,
+            .optimize = optimize,
+        });
+        const obj = b.addTest(.{ .root_module = mod });
+        const stp = b.step(s.step_name, s.desc);
+        const run = b.addRunArtifact(obj);
+        stp.dependOn(&run.step);
+        all_tests_step.dependOn(&run.step);
+    }
 
     // ============================================================================
     // Benchmark (Load Testing) Tool

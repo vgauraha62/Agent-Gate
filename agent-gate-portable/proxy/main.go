@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -197,10 +198,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	agentID := r.Header.Get("X-Agent-ID") // optional agent/session identification
 	tools := anthropic.ExtractToolInvocations(&msgReq, agentID)
 
-	// 4. Check each tool invocation against AgentGate policy
-	if len(tools) > 0 {
-		policyClient := policy.NewClient(cfg.AgentGateURL, cfg.PolicyTimeout)
+	// 4. Check each tool invocation against AgentGate policy (request-side)
+	policyClient := policy.NewClient(cfg.AgentGateURL, cfg.PolicyTimeout)
 
+	if len(tools) > 0 {
 		for _, tool := range tools {
 			result, err := policyClient.Check(&policy.CheckRequest{
 				AgentID: agentID,
@@ -222,7 +223,6 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 						policyID = result.PolicyID
 					}
 				}
-				log.Printf("POLICY DENY: tool=%s policy=%s reason=%s (agent=%s)", tool.Tool, policyID, reason, agentID)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				w.Write(policy.DenyErrorResponse(tool.Tool, policyID, reason))
@@ -238,13 +238,16 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	normalizedBody := normalizeBodyContent(body)
 	if len(normalizedBody) != len(body) {
 		log.Printf("Normalized content format for upstream request (agent=%s)", agentID)
+		log.Printf("DEBUG normalized body: %s", string(normalizedBody))
+	} else {
+		log.Printf("DEBUG body (no normalization): %s", string(body))
 	}
 
 	// 6. Forward to upstream (streaming or non-streaming)
 	upstreamClient := upstream.NewClient(cfg.AnthropicAPIURL, cfg.UpstreamTimeout)
 
 	if msgReq.Stream {
-		// SSE streaming mode
+		// SSE streaming mode — with response-side tool filtering
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -255,11 +258,22 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := upstreamClient.ForwardStream(apiKey, normalizedBody, r.Header, &flushWriter{w: w, flusher: flusher}); err != nil {
+		if err := upstreamClient.ForwardStreamFiltered(apiKey, normalizedBody, r.Header, &flushWriter{w: w, flusher: flusher}, policyClient, agentID); err != nil {
 			log.Printf("Stream error: %v", err)
+			// Write an error event so the client doesn't hang waiting for data.
+			// Headers (Content-Type: text/event-stream) were already written above,
+			// so we must speak SSE even on failure.
+			errorData, _ := json.Marshal(map[string]interface{}{
+				"type": "error",
+				"error": map[string]string{
+					"message": "upstream stream failed",
+				},
+			})
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", errorData)
+			flusher.Flush()
 		}
 	} else {
-		// Non-streaming mode
+		// Non-streaming mode — with response-side tool filtering
 		upstreamResp, err := upstreamClient.ForwardRequest(apiKey, normalizedBody, r.Header)
 		if err != nil {
 			log.Printf("Upstream error: %v", err)
@@ -268,6 +282,17 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		defer upstreamResp.Body.Close()
 
+		// Read the full response body
+		respBody, err := io.ReadAll(upstreamResp.Body)
+		if err != nil {
+			log.Printf("Failed to read upstream response: %v", err)
+			http.Error(w, "failed to read upstream response", http.StatusBadGateway)
+			return
+		}
+
+		// Check for dangerous tool_use blocks in the response
+		filteredBody := filterNonStreamingResponse(respBody, policyClient, agentID)
+
 		// Copy upstream response headers
 		for k, vv := range upstreamResp.Header {
 			for _, v := range vv {
@@ -275,7 +300,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		w.WriteHeader(upstreamResp.StatusCode)
-		io.Copy(w, upstreamResp.Body)
+		w.Write(filteredBody)
 	}
 }
 
@@ -291,4 +316,80 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 		fw.flusher.Flush()
 	}
 	return n, err
+}
+
+// filterNonStreamingResponse parses a non-streaming Anthropic API response,
+// checks each tool_use content block against the policy engine, and removes
+// any denied tool blocks from the response. Returns the (possibly modified)
+// response body.
+func filterNonStreamingResponse(body []byte, policyClient *policy.Client, agentID string) []byte {
+	var resp anthropic.MessagesResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		// Not a valid response — pass through as-is
+		return body
+	}
+
+	// Only filter responses that have content blocks
+	if len(resp.Content) == 0 {
+		return body
+	}
+
+	changed := false
+	var filtered []anthropic.ContentBlock
+
+	for _, block := range resp.Content {
+		if block.Type != "tool_use" {
+			// Text blocks pass through unchanged
+			filtered = append(filtered, block)
+			continue
+		}
+
+		// Extract tool invocation and check policy
+		toolInv := anthropic.ExtractToolInvocationFromInput(block.Name, block.Input)
+		result, err := policyClient.Check(&policy.CheckRequest{
+			AgentID: agentID,
+			Tool:    toolInv.Tool,
+			Command: toolInv.Command,
+			Path:    toolInv.Path,
+			Input:   toolInv.Input,
+		})
+
+		if err != nil || result == nil || !result.Allowed {
+			// Tool denied — replace with explanatory text block
+			reason := "policy denied"
+			policyID := "default-deny"
+			if result != nil {
+				if result.Reason != "" {
+					reason = result.Reason
+				}
+				if result.PolicyID != "" {
+					policyID = result.PolicyID
+				}
+			}
+
+			filtered = append(filtered, anthropic.ContentBlock{
+				Type: "text",
+				Text: fmt.Sprintf(
+					"[AgentGate Policy Denied] Tool '%s' was blocked by policy '%s': %s",
+					block.Name, policyID, reason,
+				),
+			})
+			changed = true
+		} else {
+			// Tool allowed — pass through unchanged
+			filtered = append(filtered, block)
+		}
+	}
+
+	if !changed {
+		return body
+	}
+
+	resp.Content = filtered
+	modifiedBody, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("Failed to marshal filtered response: %v", err)
+		return body
+	}
+	return modifiedBody
 }

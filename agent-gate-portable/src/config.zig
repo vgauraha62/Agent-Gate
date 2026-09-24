@@ -361,7 +361,7 @@ pub const PolicyConfig = struct {
     max_policies: usize = 1000,
     /// Path to policy JSON file (relative to working directory).
     /// Defaults to an absolute path inside the container.
-    policy_file: []const u8 = "/etc/agent-gate/policies/default.json",
+    policy_file: []const u8 = "policies/default.json",
 };
 
 /// Audit configuration.
@@ -430,6 +430,9 @@ pub const Config = struct {
     tls: TLSConfig = .{},
     /// Hosted API mode settings.
     api: ApiConfig = .{},
+    /// Internal: config file buffer. Set by `load()`, freed by `deinit()`.
+    /// Kept alive because string fields reference into this buffer.
+    _file_buffer: ?[]u8 = null,
 
     const Self = @This();
 
@@ -483,8 +486,10 @@ pub const Config = struct {
     /// so no owned allocations need to be freed here. All string fields
     /// point to either compile-time constants, JSON file memory managed
     /// by the caller, or the process environment block.
-    pub fn deinit(self: *Self) void {
-        _ = self;
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        if (self._file_buffer) |buf| {
+            allocator.free(buf);
+        }
     }
 
     /// Validate the configuration.
@@ -532,7 +537,7 @@ pub const Config = struct {
         defer parsed.deinit();
 
         var config = parsed.value;
-        errdefer config.deinit();
+        errdefer config.deinit(allocator);
 
         // Copy any owned strings if needed
         // For now, we use the parsed values directly
@@ -564,6 +569,8 @@ pub const Config = struct {
 
         // Merge parsed config into our config
         config = parsed.value;
+        // Retain the file buffer — string fields reference into it
+        config._file_buffer = file;
 
         // Apply environment variable overrides (highest priority)
         applyOverrides(&config, allocator);
@@ -665,7 +672,7 @@ test "Config: parse JSON" {
     const json = "{\"server\": {\"port\": 9000}, \"auth\": {\"jwt_secret\": \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\", \"auth_timeout_ms\": 200}}";
 
     var config = try Config.parse(std.testing.allocator, json);
-    defer config.deinit();
+    defer config.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 9000), config.server.port);
     try std.testing.expectEqual(@as(u32, 200), config.auth.auth_timeout_ms);
@@ -759,7 +766,7 @@ test "Config: parse JSON with TLS" {
     const json = "{\"server\": {\"port\": 8080}, \"auth\": {\"jwt_secret\": \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}, \"tls\": {\"mode\": \"native\", \"ca_cert_path\": \"./certs/ca.crt\", \"server_cert_path\": \"./certs/server.crt\", \"server_key_path\": \"./certs/server.key\"}}";
 
     var config = try Config.parse(std.testing.allocator, json);
-    defer config.deinit();
+    defer config.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(true, config.tls.isEnabled());
     try std.testing.expectEqualStrings("./certs/ca.crt", config.tls.ca_cert_path);

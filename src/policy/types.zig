@@ -160,7 +160,7 @@ pub const Condition = union(enum) {
                 return true;
             },
             // Tool conditions
-            .tool => matchesToolName(self.tool, ctx.tool_name),
+            .tool => matchesAgentId(self.tool, ctx.tool_name),
             .tool_pattern => matchesToolPattern(self.tool_pattern, ctx.tool_name),
             .command_pattern => matchesCommandPattern(self.command_pattern, ctx.tool_command),
             .path_pattern => matchesPathPattern(self.path_pattern, ctx.tool_path),
@@ -317,7 +317,7 @@ pub const PolicyError = error{
     PolicyTimeout,
 };
 
-/// Match agent_id against pattern (supports "*" wildcard).
+/// Match agent_id or tool name exactly (supports "*" wildcard).
 fn matchesAgentId(pattern: []const u8, agent_id: []const u8) bool {
     if (std.mem.eql(u8, pattern, "*")) return true;
     return std.mem.eql(u8, pattern, agent_id);
@@ -347,12 +347,6 @@ fn matchesMethodAny(methods: []const Method, method: Method) bool {
 // ============================================================================
 // AI Agent Tool Matching Functions
 // ============================================================================
-
-/// Match tool name exactly against the pattern.
-fn matchesToolName(pattern: []const u8, tool_name: []const u8) bool {
-    if (std.mem.eql(u8, pattern, "*")) return true;
-    return std.mem.eql(u8, pattern, tool_name);
-}
 
 /// Match tool name with wildcard support.
 /// Supports exact match, "*" (any tool), and "prefix_*" (prefix match).

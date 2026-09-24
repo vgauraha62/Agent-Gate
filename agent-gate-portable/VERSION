@@ -1,0 +1,10 @@
+# agent-gate-portable - release snapshot, not live code
+# Cut: 2026-09-22 from repo root @ 016e5d2
+# Purpose: shippable offline bundle for air-gapped deploys.
+# Live dev happens in repo root; refresh this dir on each release cut.
+# Intentionally NOT synced from root (do not fix these diffs):
+# README.md, switch.sh - portable installer flow, simpler by design
+# env template - pairs with portable compose/service layout
+# license public key - portable ships its own keypair;
+# overwriting one half orphans the other. Rotate both together or neither.
+# src/audit_logger.zig, src/policy/policies.json - portable-only files

@@ -217,8 +217,6 @@ func (c *Client) evaluateToolPolicy(policyClient *policy.Client, pending *anthro
 	result.PolicyID = checkResp.PolicyID
 
 	if !checkResp.Allowed {
-		log.Printf("POLICY DENY (response tool): tool=%s command=%s path=%s policy=%s reason=%s",
-			pending.ToolName, pending.Command, pending.Path, checkResp.PolicyID, checkResp.Reason)
 	} else {
 		log.Printf("POLICY ALLOW (response tool): tool=%s command=%s path=%s",
 			pending.ToolName, pending.Command, pending.Path)

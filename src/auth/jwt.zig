@@ -362,127 +362,25 @@ fn verifySignature(
     return secureCompare(expected_sig[0..sig_len], signature);
 }
 
-/// Manual HMAC-SHA256 implementation - returns fixed-size array.
-/// Uses heap allocation for inner/outer message buffers to avoid stack overflow
-/// with large messages (the fixed [256]u8 stack buffers previously overflowed).
+/// HMAC-SHA256 via stdlib (no alloc, stack-safe).
+// ponytail: std.crypto.auth.hmac replaces 3 hand-rolled HMAC fns
 fn hmacSha256(key: []const u8, message: []const u8) ![32]u8 {
-    const block_size = 64;
-    var key_block: [block_size]u8 = .{0} ** block_size;
     var result: [32]u8 = undefined;
-
-    // If key is longer than block size, hash it first
-    if (key.len > block_size) {
-        var hash_buf: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(key, &hash_buf, .{});
-        @memcpy(key_block[0..32], &hash_buf);
-    } else {
-        @memcpy(key_block[0..key.len], key);
-    }
-
-    // XOR with ipad (0x36) and opad (0x5c)
-    var ipad: [block_size]u8 = undefined;
-    var opad: [block_size]u8 = undefined;
-    for (0..block_size) |i| {
-        ipad[i] = key_block[i] ^ 0x36;
-        opad[i] = key_block[i] ^ 0x5c;
-    }
-
-    // Inner hash: H((key ^ ipad) || message)
-    // Use dynamic allocation for inner_msg to support arbitrarily large messages
-    var inner: [32]u8 = undefined;
-    const inner_msg = try std.heap.page_allocator.alloc(u8, block_size + message.len);
-    defer std.heap.page_allocator.free(inner_msg);
-    @memcpy(inner_msg[0..block_size], &ipad);
-    @memcpy(inner_msg[block_size..], message);
-    std.crypto.hash.sha2.Sha256.hash(inner_msg, &inner, .{});
-
-    // Outer hash: H((key ^ opad) || inner)
-    const outer_msg = try std.heap.page_allocator.alloc(u8, block_size + 32);
-    defer std.heap.page_allocator.free(outer_msg);
-    @memcpy(outer_msg[0..block_size], &opad);
-    @memcpy(outer_msg[block_size..], &inner);
-    std.crypto.hash.sha2.Sha256.hash(outer_msg, &result, .{});
-
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&result, message, key);
     return result;
 }
 
-/// Manual HMAC-SHA384 implementation - returns fixed-size array.
-/// Uses heap allocation for inner/outer message buffers to avoid stack overflow.
+/// HMAC-SHA384 via stdlib.
 fn hmacSha384(key: []const u8, message: []const u8) ![48]u8 {
-    const block_size = 128;
-    var key_block: [block_size]u8 = .{0} ** block_size;
     var result: [48]u8 = undefined;
-
-    if (key.len > block_size) {
-        var hash_buf: [48]u8 = undefined;
-        std.crypto.hash.sha2.Sha384.hash(key, &hash_buf, .{});
-        @memcpy(key_block[0..48], &hash_buf);
-    } else {
-        @memcpy(key_block[0..key.len], key);
-    }
-
-    var ipad: [block_size]u8 = undefined;
-    var opad: [block_size]u8 = undefined;
-    for (0..block_size) |i| {
-        ipad[i] = key_block[i] ^ 0x36;
-        opad[i] = key_block[i] ^ 0x5c;
-    }
-
-    // Inner hash — dynamic allocation to avoid stack overflow
-    var inner: [48]u8 = undefined;
-    const inner_msg = try std.heap.page_allocator.alloc(u8, block_size + message.len);
-    defer std.heap.page_allocator.free(inner_msg);
-    @memcpy(inner_msg[0..block_size], &ipad);
-    @memcpy(inner_msg[block_size..], message);
-    std.crypto.hash.sha2.Sha384.hash(inner_msg, &inner, .{});
-
-    // Outer hash — dynamic allocation to avoid stack overflow
-    const outer_msg = try std.heap.page_allocator.alloc(u8, block_size + 48);
-    defer std.heap.page_allocator.free(outer_msg);
-    @memcpy(outer_msg[0..block_size], &opad);
-    @memcpy(outer_msg[block_size..], &inner);
-    std.crypto.hash.sha2.Sha384.hash(outer_msg, &result, .{});
-
+    std.crypto.auth.hmac.sha2.HmacSha384.create(&result, message, key);
     return result;
 }
 
-/// Manual HMAC-SHA512 implementation - returns fixed-size array.
-/// Uses heap allocation for inner/outer message buffers to avoid stack overflow.
+/// HMAC-SHA512 via stdlib.
 fn hmacSha512(key: []const u8, message: []const u8) ![64]u8 {
-    const block_size = 128;
-    var key_block: [block_size]u8 = .{0} ** block_size;
     var result: [64]u8 = undefined;
-
-    if (key.len > block_size) {
-        var hash_buf: [64]u8 = undefined;
-        std.crypto.hash.sha2.Sha512.hash(key, &hash_buf, .{});
-        @memcpy(key_block[0..64], &hash_buf);
-    } else {
-        @memcpy(key_block[0..key.len], key);
-    }
-
-    var ipad: [block_size]u8 = undefined;
-    var opad: [block_size]u8 = undefined;
-    for (0..block_size) |i| {
-        ipad[i] = key_block[i] ^ 0x36;
-        opad[i] = key_block[i] ^ 0x5c;
-    }
-
-    // Inner hash — dynamic allocation to avoid stack overflow
-    var inner: [64]u8 = undefined;
-    const inner_msg = try std.heap.page_allocator.alloc(u8, block_size + message.len);
-    defer std.heap.page_allocator.free(inner_msg);
-    @memcpy(inner_msg[0..block_size], &ipad);
-    @memcpy(inner_msg[block_size..], message);
-    std.crypto.hash.sha2.Sha512.hash(inner_msg, &inner, .{});
-
-    // Outer hash — dynamic allocation to avoid stack overflow
-    const outer_msg = try std.heap.page_allocator.alloc(u8, block_size + 64);
-    defer std.heap.page_allocator.free(outer_msg);
-    @memcpy(outer_msg[0..block_size], &opad);
-    @memcpy(outer_msg[block_size..], &inner);
-    std.crypto.hash.sha2.Sha512.hash(outer_msg, &result, .{});
-
+    std.crypto.auth.hmac.sha2.HmacSha512.create(&result, message, key);
     return result;
 }
 

@@ -1,220 +1,142 @@
-# Agent-Gate: Policy-Based Access Control System
+# AgentGate
 
-A Rust-based authorization framework built in Zig for implementing policy-based access control (PBAC) systems. This implementation provides a robust and extensible architecture for managing agent permissions, audit logging, and security policies.
-
-## Architecture Overview
+Policy gate for AI-agent tool calls. AI clients (OpenCode / Claude Code) talk to a
+Go proxy; every tool invocation is checked against a Zig policy engine before it
+reaches the model upstream. Deny-by-default, denial audit, Prometheus metrics.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Agent-Gate System                          │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
-│  │   Agent      │───▶│   Policy     │───▶│   Event       │      │
-│  │  Context     │    │ Validator    │    │  Logger       │      │
-│  └──────────────┘    └──────────────┘    └──────────────┘      │
-│         ▲                  ▲                   ▲                │
-│         │                  │                   │                │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
-│  │   Resource   │◀───│   Rule       │◀───│   Config     │      │
-│  │  Metadata    │    │ Matcher      │    │ Loader        │      │
-│  └──────────────┘    └──────────────┘    └──────────────┘      │
-└─────────────────────────────────────────────────────────────────┘
+OpenCode / Claude Code
+        │  POST /v1/messages (Anthropic API)
+        ▼
+┌──────────────┐  POST /check   ┌───────────────┐
+│ Proxy   :8080 │──────────────▶│ AgentGate     │
+│ (Go)          │◀ allow / deny │ (Zig)   :8081 │
+└──────┬───────┘               └───────────────┘
+       │ allowed only                ▲ denial ring (1000) + audit log
+       ▼                             │ GET /denied-requests, /metrics :9090
+┌──────────────┐               ┌───────────────┐
+│ LiteLLM :4000 │  translate    │ License srv   │
+│ Anthropic↔OA  │  + route      │ (Go)    :4001 │
+└──────┬───────┘               └───────────────┘
+       ▼
+Upstream model (Zen / Anthropic / Ollama)
 ```
 
-## Core Components
+## Services (`docker-compose.yml`)
 
-### 1. Agent Module (`src/agent.zig`)
+| container | role | ports |
+|---|---|---|
+| proxy | Go proxy, license gate, tool extraction, SSE filter | 8080 |
+| agentgate | Zig policy engine | 8081 (API), 9090 (metrics) |
+| litellm | format translation + upstream routing | 4000 |
+| license-server | RSA-signed JWT license issue/verify | 4001 |
 
-- **Agent context** with ID, timestamp, and permissions
-- **Permission bitmask** for efficient access control
-- Support for:
-  - User read/write operations
-  - Admin operations
-  - Policy management
-  - Audit access
-
-### 2. Rule Engine (`src/rules/`)
-
-- **Policy rules** with priority and timeout settings
-- **Matcher system** for condition evaluation
-- **Event stream processor** for real-time authorization
-
-### 3. Resource Metadata (`src/resources/`)
-
-- Resource descriptors with access paths
-- Attribute-based filtering
-- Permission inheritance chains
-
-### 4. Event Logging (`src/events/`)
-
-- Audit trail persistence
-- Security event capture
-- Compliance reporting support
-
-### 5. Configuration (`config.zig`)
-
-- YAML/JSON schema for policies
-- Environment variable injection
-- Hot-reload capabilities
-
-## Installation
+## Quick start
 
 ```bash
-cd /home/vg/opensource/Agent-Gate
+cp .env.example .env && chmod 600 .env   # fill LICENSE_KEY, AGENTGATE_JWT_SECRET, OPENCODE_API_KEY
+docker compose up -d --build
 
-# Clone and build
-git clone https://github.com/vg/agent-gate.git
-cd Agent-Gate
-
-# Install dependencies
-zig build install
-
-# Run tests
-zig build test
-
-# Build release
-zig build -Drelease=true
+curl http://localhost:8081/health   # agentgate
+curl http://localhost:8080/health   # proxy
+curl http://localhost:4000/health   # litellm
 ```
 
-## Configuration Example
+Point OpenCode at the proxy (`~/.config/opencode/opencode.json`):
 
-```yaml
-# config.yaml
-server:
-  host: "0.0.0.0"
-  port: 8080
-
-agent:
-  id_prefix: "agent-"
-  default_timeout: 3600  # seconds
-
-policy:
-  default_denial: true
-  max_rules_per_group: 1000
-
-logging:
-  level: "info"
-  file: "/var/log/agent-gate/audit.log"
-  format: "json"
-```
-
-## Usage
-
-```zig
-const std = @import("std");
-const Server = @import("server.zig").Server;
-const Config = @import("config.zig").Config;
-
-pub fn main() !void {
-    // Initialize configuration
-    var config = try Config.initFromFile("config.yaml");
-    
-    // Create server instance
-    var server = try Server.init(&config);
-    
-    // Load policies
-    try server.loadPolicies();
-    
-    // Validate secrets
-    try server.validateSecrets();
-    
-    // Bind and start server
-    try server.bind("0.0.0.0", 8080);
-    try server.run();
-    
-    // Cleanup
-    defer server.deinit();
+```json
+{
+  "model": "agentgate/deepseek-v4-flash-free",
+  "provider": {
+    "agentgate": {
+      "options": { "baseURL": "http://localhost:8080", "apiKey": "test-key" }
+    }
+  }
 }
 ```
 
-## API Documentation
-
-### Agent API
-
-```zig
-const Agent = @import("agent.zig").Agent;
-
-// Create authenticated agent
-const agent = Agent.init(id, timestamp, permissions);
-
-// Grant permission
-agent.grantPermission(.read_users);
-
-// Revoke permission
-agent.clearPermission(.write_admin);
-
-// Check authentication
-if (agent.isAuthenticated()) {
-    std.debug.print("Agent {s} is authenticated\n", .{agent.id});
-}
-```
-
-### Permission Flags
-
-```zig
-pub const Permission = enum(u64) {
-    read_users = 1 << 0,
-    write_users = 1 << 1,
-    read_admin = 1 << 2,
-    write_admin = 1 << 3,
-    read_policies = 1 << 4,
-    write_policies = 1 << 5,
-    read_audit = 1 << 6,
-    write_audit = 1 << 7,
-};
-```
-
-## Security Features
-
-- **Zero-copy permission checks**: Bitwise operations
-- **Cryptographic identity**: 32-byte agent IDs
-- **Secret validation**: Environment variable injection
-- **Audit trail**: Immutable event logging
-- **Policy isolation**: Resource-level permission scoping
-
-## Testing
-
-Run unit tests:
+Test the chat path:
 
 ```bash
-zig build test
-zig build test-coverage
+curl -X POST http://localhost:8080/v1/messages \
+  -H 'Content-Type: application/json' -H 'x-api-key: test-key' \
+  -d '{"model":"deepseek-v4-flash-free","max_tokens":50,
+       "messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Example test:
+Air-gapped / portable bundle: see [`agent-gate-portable/`](agent-gate-portable/) and its
+[README](agent-gate-portable/README.md) (`setup.sh` bootstraps a new machine).
 
-```zig
-test "Agent basic creation" {
-    const id = [_]u8{1} ** 32;
-    var agent = Agent.init(id, 1234567890, PermissionSet{});
-    
-    try std.testing.expectEqualSlices(u8, &id, agent.idSlice());
-    try std.testing.expectEqual(@as(i128, 1234567890), agent.authenticated_at);
-}
+## API
+
+| method | url | purpose |
+|---|---|---|
+| POST | `localhost:8080/v1/messages` | chat path (proxy → policy → litellm) |
+| POST | `localhost:8081/check` | raw policy decision (allow/deny JSON) |
+| GET | `localhost:8081/denied-requests?limit=20` | denial audit ring |
+| GET | `localhost:9090/metrics` | Prometheus counters |
+| GET | `localhost:8080/health` | proxy health |
+
+Observe denials live: `docker logs agent-gate-agentgate-1 | grep "IO IN"` (headers+body)
+and `grep "IO OUT"` (decision). Gated by `ENABLE_IO_DUMP` in `src/server/http.zig`;
+secrets are redacted from dumps.
+
+## Policy model
+
+Runtime file: `policies/ai-agent.json` (36 rules, mounted read-only into agentgate).
+First-match-wins; no match → deny. Destructive-command deny rules + sensitive-path
+deny rules first, then workspace allow rules. Matchers: exact/wildcard tool and agent,
+substring command, prefix/substring path (see `src/policy/types.zig`).
+
+Regenerate the policy/endpoint tables in the living docs after editing rules:
+
+```bash
+python3 tools/gen-docs.py          # rewrite generated blocks
+python3 tools/gen-docs.py --check  # CI drift check
 ```
+
+## Configuration
+
+`.env` (never committed — see `.env.example`): `LICENSE_KEY`, `ADMIN_API_KEY`,
+`AGENTGATE_JWT_SECRET`, `OPENCODE_API_KEY`, plus mode files `.env.opencode` /
+`.env.claude` selecting upstream (`AGENTGATE_PROXY_ANTHROPIC_URL`).
+Switch modes: `./switch.sh opencode|claude`, then `docker compose up -d --build`.
+AgentGate engine config: `config.json` (server/policy/timeouts/auth/tls).
+LiteLLM routing: `litellm-config.yaml`.
+
+## Develop
+
+Requires Zig 0.15.2 (see `.zig-version`), Go 1.22+, Docker.
+
+```bash
+zig build test-all   # unit + e2e + config + security + audit + gap suites
+zig build run        # run agentgate locally
+docker compose logs -f proxy | head -50
+```
+
+Repo layout: `src/` (Zig engine: `server/http.zig`, `policy/`, `auth/`, `audit/`,
+`metrics/`), `proxy/` (Go), `license-server/` (Go + SQLite), `policies/`,
+`scripts/` (certs, license seed, mtls/proxy tests), `tools/` (`gen-docs.py`,
+`loadtest.zig`), `docs/`, `agent-gate-portable/` (release snapshot bundle).
+
+## Docs
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — canonical system overview
+- [`docs/HLD.md`](docs/HLD.md) / [`docs/LLD.md`](docs/LLD.md) — high/low-level design
+- [`docs/CURRENT_WORKING.md`](docs/CURRENT_WORKING.md) — live topology, endpoints, policy table
+- [`docs/saas/`](docs/saas/) — full SaaS/deployment guide (13 parts)
+- [`docs/adr/`](docs/adr/) — policy collapse, denial-log, IO-dump decisions
+
+## Security notes
+
+- Never commit `.env*`, `config.json`, `keys/`, `certs/`, `*.pem`/`*.key`/`*.p12`
+  (enforced by `.gitignore`). `proxy/license/public.pem` is the only committed key,
+  and it is public.
+- Past commits once contained private keys/certs and an API key; they were removed
+  from tracking. **Rotate any credential that ever appeared in git history.**
+- Planning/scratch docs (`task_plan.md`, `progress.md`, `findings.md`, `commands*.txt`,
+  `docs/plans/`) are local-only and git-ignored.
 
 ## License
 
-MIT License - See LICENSE file for details.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Submit pull requests with tests
-4. Follow Zig coding standards
-
-## Dependencies
-
-- Zig v0.11+
-- Linux Kernel 5.4+
-- OpenSSL 1.1+ for TLS support
-
-## Contact
-
-- Issues: [GitHub Issues](https://github.com/vg/agent-gate/issues)
-- Documentation: [ReadTheDocs](https://agent-gate.readthedocs.org)
-
----
-
-**Note**: This implementation uses Zig for maximum performance in a Rust-like ecosystem.
+MIT — no LICENSE file in repo yet; add one before publishing.

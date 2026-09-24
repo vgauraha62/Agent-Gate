@@ -23,6 +23,8 @@ services:
         condition: service_healthy
       litellm:
         condition: service_healthy
+      license-server:
+        condition: service_started
     networks:
       - agentgate-net
     restart: unless-stopped
@@ -88,11 +90,13 @@ services:
       - "4000:4000"
     volumes:
       - ./litellm-config.yaml:/app/config.yaml:ro,z
+    env_file:
+      - .env
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import http.client; c=http.client.HTTPConnection('127.0.0.1',4000); c.request('GET','/health/readiness'); r=c.getresponse(); assert r.status==200\""]
-      interval: 3s
+      interval: 10m
       timeout: 5s
-      retries: 10
+      retries: 3
       start_period: 20s
     entrypoint: ["litellm", "--config", "/app/config.yaml", "--port", "4000"]
     networks:

@@ -67,7 +67,7 @@ claude
 ### Check metrics
 
 ```bash
-curl http://localhost:9090/metrics
+curl http://localhost:8081/metrics
 ```
 
 Expected: Prometheus-formatted metrics including:
@@ -119,7 +119,7 @@ curl -X POST http://localhost:8081/check \
   -H "Content-Type: application/json" \
   -d '{"tool":"bash","command":"rm -rf /"}'
 
-# Expected: {"allowed":false,"reason":"policy denied by: block-rm-rf","policy_id":"block-rm-rf"}
+# Expected: {"allowed":false,"reason":"policy denied by: block-rm","policy_id":"block-rm"}
 ```
 
 ### Test blocked file read

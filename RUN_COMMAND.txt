@@ -1,9 +1,0 @@
-Next time you run the app
-zig build run -- --config config.json
-Or set the env var (highest priority):
-export AGENTGATE_AUTH_JWT_SECRET="sQJIiZjrE1zBja5gYkY28qI39mQhcl66"
-zig build run
-For new clones
-Since config.json is gitignored, you'll need to regenerate the secret:
-openssl rand -base64 24
-# Then update auth.jwt_secret in config.json

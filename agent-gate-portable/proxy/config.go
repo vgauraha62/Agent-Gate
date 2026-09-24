@@ -20,7 +20,7 @@ type Config struct {
 func LoadConfig() *Config {
 	return &Config{
 		ListenAddr:       getEnv("AGENTGATE_PROXY_LISTEN", ":8080"),
-		AgentGateURL:     getEnv("AGENTGATE_PROXY_AGENTGATE_URL", "http://agentgate:8081"),
+		AgentGateURL:     getEnv("AGENTGATE_PROXY_AGENTGATE_URL", "http://agentgate:8080"),
 		AnthropicAPIURL:  getEnv("AGENTGATE_PROXY_ANTHROPIC_URL", "https://api.anthropic.com"),
 		PolicyTimeout:    getDuration("AGENTGATE_PROXY_POLICY_TIMEOUT", 5*time.Second),
 		UpstreamTimeout:  getDuration("AGENTGATE_PROXY_UPSTREAM_TIMEOUT", 300*time.Second),

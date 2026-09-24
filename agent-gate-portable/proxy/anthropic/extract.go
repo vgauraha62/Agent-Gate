@@ -33,21 +33,29 @@ func ExtractToolInvocations(req *MessagesRequest, agentID string) []ToolInvocati
 		}
 	}
 
-	// Also extract from tool definitions themselves (for policy evaluation
-	// of which tools the model is even allowed to use)
-	for _, t := range req.Tools {
-		invocations = append(invocations, ToolInvocation{
-			AgentID: agentID,
-			Tool:    t.Name,
-			Input:   t.InputSchema,
-		})
-	}
+	// Tool definitions ("tools" array) are intentionally NOT checked here.
+	// They define what tools the AI may use, not actual invocations.
+	// Actual tool invocations appear in message content as type:"tool_use" blocks
+	// and are checked above. Response-side SSE filtering handles dangerous
+	// tool_use blocks produced by the AI during streaming.
 
 	return invocations
 }
 
 // extractToolArgs parses known tool schemas to extract structured fields
 // like command and path from the raw JSON input.
+// ExtractToolInvocationFromInput extracts a ToolInvocation from raw tool input JSON.
+// This is used for response-side filtering where tool_use blocks come from the AI's
+// streaming SSE response rather than from the request body.
+func ExtractToolInvocationFromInput(toolName string, inputJSON json.RawMessage) *ToolInvocation {
+	inv := &ToolInvocation{
+		Tool:  toolName,
+		Input: inputJSON,
+	}
+	extractToolArgs(toolName, inputJSON, inv)
+	return inv
+}
+
 func extractToolArgs(name string, input json.RawMessage, inv *ToolInvocation) {
 	var fields map[string]interface{}
 	if err := json.Unmarshal(input, &fields); err != nil {

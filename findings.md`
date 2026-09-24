@@ -1,6 +1,0 @@
-# Findings: Day 13 Deployment Artifacts
-
-## Research & Discoveries
-- [ ] Docker base image choices
-- [ ] K8s resource limit validation
-- [ ] Zig binary compatibility with Alpine (musl)

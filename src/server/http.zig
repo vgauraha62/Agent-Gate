@@ -19,6 +19,7 @@ const apikey_mod = @import("../apikey.zig");
 
 // Compile-time flags
 const ENABLE_DEBUG_LOGS = false;  // Disable debug logging in production
+const ENABLE_IO_DUMP = true; // ponytail: /check IO dump to stderr, flip off when done
 
 // ============================================================
 // Constants
@@ -39,9 +40,9 @@ const EPOLL_CTL_DEL: c_int = 3;
 const HEALTH_RESPONSE = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
 const AGENTS_RESPONSE = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n[]";
 const NOT_FOUND_RESPONSE = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nnot found";
-const JSON_OK_RESPONSE = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: keep-alive\r\n\r\n{\"allowed\":true}";
-const JSON_BAD_REQUEST_RESPONSE = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 21\r\nConnection: keep-alive\r\n\r\n{\"error\":\"Invalid request\"}";
-const JSON_UNAUTHORIZED_RESPONSE = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 30\r\nConnection: keep-alive\r\n\r\n{\"error\":\"missing authorization header\"}";
+const JSON_OK_RESPONSE = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: keep-alive\r\n\r\n{\"allowed\":true}";
+const JSON_BAD_REQUEST_RESPONSE = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: keep-alive\r\n\r\n{\"error\":\"Invalid request\"}";
+const JSON_UNAUTHORIZED_RESPONSE = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 40\r\nConnection: keep-alive\r\n\r\n{\"error\":\"missing authorization header\"}";
 
 // ============================================================
 // Public Types
@@ -222,6 +223,27 @@ pub fn parseSSLHeaders(headers: []const u8) ?SSLClientInfo {
 
 /// Extract a header value from raw HTTP headers.
 /// Returns the value part (after the colon) or null if not found.
+
+// ponytail: mask secret header values for the IO dump
+fn redactHeaders(headers: []const u8, out: *[8192]u8) []const u8 {
+    const n = @min(headers.len, out.len);
+    @memcpy(out[0..n], headers[0..n]);
+    var red = out[0..n];
+    var i: usize = 0;
+    while (i < n) {
+        const eol = std.mem.indexOfPos(u8, red, i, "\r\n") orelse n;
+        const seg = red[i..eol];
+        const is_secret = (seg.len > 10 and std.ascii.eqlIgnoreCase(seg[0..10], "x-api-key:")) or (seg.len > 14 and std.ascii.eqlIgnoreCase(seg[0..14], "authorization:")) or (seg.len > 18 and std.ascii.eqlIgnoreCase(seg[0..18], "x-ssl-client-cert:")) or (seg.len > 7 and std.ascii.eqlIgnoreCase(seg[0..7], "cookie:"));
+        if (is_secret) {
+            const ci = std.mem.indexOf(u8, seg, ":") orelse seg.len;
+            var k: usize = ci + 1;
+            while (k < seg.len) : (k += 1) seg[k] = 'x';
+        }
+        i = eol + 2;
+    }
+    return red;
+}
+
 fn extractHeaderValue(headers: []const u8, header_name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i + header_name.len < headers.len) : (i += 1) {
@@ -619,6 +641,11 @@ fn acceptConnections(self: *Self) void {
                 }
             } else if (std.mem.eql(u8, parsed.path, "/check") and std.mem.eql(u8, parsed.method, "POST")) {
                 // In hosted mode, validate API key first
+                // ponytail: /check-only IO dump, stderr->docker logs; secrets redacted
+                if (ENABLE_IO_DUMP) {
+                    var io_redact_buf: [8192]u8 = undefined;
+                    std.debug.print("[IO IN] {s} {s} headers={s} body={s}\n", .{ parsed.method, parsed.path, redactHeaders(parsed.headers, &io_redact_buf), parsed.body });
+                }
                 if (self.hosted_ctx) |ctx| {
                     const api_key_hdr = extractHeaderValueRaw(buffer[0..@as(usize, @intCast(bytes_read))], "X-API-Key");
                     if (api_key_hdr) |key| {
@@ -736,66 +763,23 @@ fn acceptConnections(self: *Self) void {
                 if (i + 12 <= headers.len and headers[i..i+12].len == 12) {
                     // Check if it's "Connection:" (12 chars)
                     const slice = headers[i..i+12];
-                    if (slice[0] == 'C' and slice[1] == 'o' and slice[2] == 'n' and
-                        slice[3] == 'n' and slice[4] == 'e' and slice[5] == 'c' and
-                        slice[6] == 't' and slice[7] == 'i' and slice[8] == 'o' and
-                        slice[9] == 'n' and slice[10] == ':') {
+                    if (std.ascii.eqlIgnoreCase(slice[0..11], "connection:")) {
                         // Found Connection header, check value
                         var j = i + 12;
                         while (j < headers.len and (headers[j] == ' ' or headers[j] == '\t')) j += 1;
                         if (j + 10 <= headers.len) {
+                            // ponytail: explicit close wins.
+                            if (j + 5 <= headers.len and std.ascii.eqlIgnoreCase(headers[j..][0..5], "close")) return false;
                             const value = headers[j..j+10];
-                            // Check for "keep-alive" (case insensitive)
-                            if (value.len >= 10 and
-                                (value[0] == 'k' or value[0] == 'K') and
-                                (value[1] == 'e' or value[1] == 'E') and
-                                (value[2] == 'e' or value[2] == 'E') and
-                                (value[3] == 'p' or value[3] == 'P') and
-                                (value[4] == '-' or value[4] == '-') and
-                                (value[5] == 'a' or value[5] == 'A') and
-                                (value[6] == 'l' or value[6] == 'L') and
-                                (value[7] == 'i' or value[7] == 'I') and
-                                (value[8] == 'v' or value[8] == 'V') and
-                                (value[9] == 'e' or value[9] == 'E')) {
-                                return true;
-                            }
+                            // ponytail: stdlib case-insensitive compare
+                            if (std.ascii.eqlIgnoreCase(value, "keep-alive")) return true;
                         }
                     }
                 }
             }
         }
-        return false;
-    }
-
-    /// Check if client requested keep-alive connection
-    /// Scans headers for "Connection: keep-alive" (case-insensitive)
-    fn wantsKeepAlive(headers: []const u8) bool {
-        // Look for "Connection:" header
-        const search = "Connection:";
-        var i: usize = 0;
-        while (i + search.len < headers.len) : (i += 1) {
-            if (headers[i] == 'C' or headers[i] == 'c') {
-                if (i + search.len <= headers.len and
-                    std.mem.eql(u8, headers[i..][0..search.len], search)) {
-                    // Found Connection header, check value
-                    var j = i + search.len;
-                    while (j < headers.len and (headers[j] == ' ' or headers[j] == '\t')) j += 1;
-                    const value_start = j;
-                    while (j < headers.len and headers[j] != '\r' and headers[j] != '\n') j += 1;
-                    const value = headers[value_start..j];
-
-                    // Check if value starts with "keep-alive" (case-insensitive)
-                    if (value.len >= 10) {
-                        const lower_first = std.ascii.toLower(value[0]);
-                        if (lower_first == 'k' and
-                            std.mem.eql(u8, value[0..10], "keep-alive")) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        return false;
+        // HTTP/1.1 default: persistent unless Connection: close was found.
+        return true;
     }
 
     // ============================================================
@@ -810,6 +794,23 @@ fn acceptConnections(self: *Self) void {
         is_tool_request: bool,
     };
     
+    /// Scan a JSON string value: j is the first char after the opening quote.
+    /// Returns the index of the closing quote. Backslash escapes are skipped
+    /// so an escaped quote (\") does not terminate the value early.
+    /// ponytail: no unescaping — substring patterns match the raw escaped text.
+    fn scanJsonStringValue(body: []const u8, start_j: usize) usize {
+        var j = start_j;
+        while (j < body.len) {
+            if (body[j] == '\\') {
+                j += 2;
+                continue;
+            }
+            if (body[j] == '"') break;
+            j += 1;
+        }
+        return j;
+    }
+
     /// Parse the /check request body. Supports both the legacy format
     /// (path + method) and the extended tool-aware format
     /// (agent_id + tool + command + path + input).
@@ -834,7 +835,7 @@ fn acceptConnections(self: *Self) void {
                 while (j < body.len and body[j] != ':') j += 1;
                 while (j < body.len and (body[j] == ':' or body[j] == ' ' or body[j] == '"')) j += 1;
                 const start = j;
-                while (j < body.len and body[j] != '"') j += 1;
+                j = scanJsonStringValue(body, j);
                 if (j > start) result.tool = body[start..j];
             }
             // Parse "command" field (tool request)
@@ -845,7 +846,7 @@ fn acceptConnections(self: *Self) void {
                 while (j < body.len and body[j] != ':') j += 1;
                 while (j < body.len and (body[j] == ':' or body[j] == ' ' or body[j] == '"')) j += 1;
                 const start = j;
-                while (j < body.len and body[j] != '"') j += 1;
+                j = scanJsonStringValue(body, j);
                 if (j > start) result.command = body[start..j];
             }
             // Parse "path" field (shared between legacy and tool format)
@@ -855,7 +856,7 @@ fn acceptConnections(self: *Self) void {
                 while (j < body.len and body[j] != ':') j += 1;
                 while (j < body.len and (body[j] == ':' or body[j] == ' ' or body[j] == '"')) j += 1;
                 const start = j;
-                while (j < body.len and body[j] != '"') j += 1;
+                j = scanJsonStringValue(body, j);
                 if (j > start) result.path = body[start..j];
             }
             // Parse "method" field (legacy format)
@@ -866,7 +867,7 @@ fn acceptConnections(self: *Self) void {
                 while (j < body.len and body[j] != ':') j += 1;
                 while (j < body.len and (body[j] == ':' or body[j] == ' ' or body[j] == '"')) j += 1;
                 const start = j;
-                while (j < body.len and body[j] != '"') j += 1;
+                j = scanJsonStringValue(body, j);
                 if (j > start) result.method = body[start..j];
             }
             i += 1;
@@ -911,6 +912,7 @@ fn acceptConnections(self: *Self) void {
         switch (decision.effect) {
             .allow => {
                 sendJsonResponse(client_fd, .ok, "{\"allowed\":true}");
+                if (ENABLE_IO_DUMP) std.debug.print("[IO OUT] allowed=true\n", .{});
                 return true;
             },
             .deny => {
@@ -937,6 +939,7 @@ fn acceptConnections(self: *Self) void {
                     .{ decision.policy_id, decision.policy_id }) catch "{\"allowed\":false,\"reason\":\"policy denied\"}";
 
                 sendJsonResponse(client_fd, .forbidden, response);
+                if (ENABLE_IO_DUMP) std.debug.print("[IO OUT] allowed=false policy={s} body={s}\n", .{ decision.policy_id, response });
                 return false;
             },
         }
@@ -1029,38 +1032,14 @@ fn acceptConnections(self: *Self) void {
     
     fn sendMetricsResponse(client_fd: c_int) void {
         const metrics = prometheus.global_metrics.exportMetrics();
-        
-        // Simple approach: write parts separately
-        const header1 = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ";
-        _ = c.write(client_fd, header1, header1.len);
-        
-        // Write content-length as string manually
+
+        // ponytail: bufPrint over manual int->string, same output
         var len_buf: [16]u8 = undefined;
-        var len_pos: usize = 0;
-        var mlen = metrics.len;
-        if (mlen == 0) {
-            len_buf[0] = '0';
-            len_pos = 1;
-        } else {
-            while (mlen > 0) {
-                len_buf[len_pos] = '0' + @as(u8, @intCast(mlen % 10));
-                len_pos += 1;
-                mlen /= 10;
-            }
-        }
-        // Reverse
-        var i: usize = 0;
-        while (i < len_pos / 2) {
-            const tmp = len_buf[i];
-            len_buf[i] = len_buf[len_pos - 1 - i];
-            len_buf[len_pos - 1 - i] = tmp;
-            i += 1;
-        }
-        _ = c.write(client_fd, &len_buf, len_pos);
-        
-        const header2 = "\r\n\r\n";
-        _ = c.write(client_fd, header2, header2.len);
-        
+        const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{metrics.len}) catch "0";
+        var hdr_buf: [128]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {s}\r\n\r\n", .{len_str}) catch return;
+        _ = c.write(client_fd, hdr.ptr, hdr.len);
+
         // Write metrics
         _ = c.write(client_fd, metrics.ptr, metrics.len);
     }

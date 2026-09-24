@@ -223,7 +223,6 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 						policyID = result.PolicyID
 					}
 				}
-				log.Printf("POLICY DENY: tool=%s policy=%s reason=%s (agent=%s)", tool.Tool, policyID, reason, agentID)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				w.Write(policy.DenyErrorResponse(tool.Tool, policyID, reason))
@@ -367,8 +366,6 @@ func filterNonStreamingResponse(body []byte, policyClient *policy.Client, agentI
 					policyID = result.PolicyID
 				}
 			}
-			log.Printf("POLICY DENY (response): tool=%s command=%s path=%s policy=%s reason=%s",
-				block.Name, toolInv.Command, toolInv.Path, policyID, reason)
 
 			filtered = append(filtered, anthropic.ContentBlock{
 				Type: "text",

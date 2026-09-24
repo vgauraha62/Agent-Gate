@@ -1,51 +1,73 @@
-# Zig build cache (per-project)
+# Zig build cache (per-project) + output
 .zig-cache/
-
-# Build output (binaries and artifacts)
 zig-out/
-
-# Dependencies (downloaded by zig)
+build/
 dependencies/
 
-# Editor and IDE
+# Go
+proxy/agent_gate
+license-server/license-server
+
+# Editor / OS
 .idea/
 .vscode/
 *.swp
 *.swo
 .DS_Store
 
-# GPG keys (never commit)
+# Secrets — never commit (rotate anything once committed)
+.env
+.env.*
+!.env.example
+config.json
+config.local.json
+keys/
+certs/
+*.pem
+!proxy/license/public.pem
+!agent-gate-portable/proxy/license/public.pem
+*.key
+*.p12
 my-gpg-key1.asc
 
-# Analysis and tracking files
-analysis_minimax.md
-commands.txt
-commands_analysis.txt
-progress.md
-task_plan.md
-findings.md
+# Planning / scratch docs (local-only)
+task_plan.md*
+progress.md*
+findings.md*
+commands*.txt
+NGINX_commands.txt
+ISSUES_NGINX.txt
+RUN_COMMAND.txt
+STORAGE_STATUS.txt
 test_script.txt
 *_summary.txt
-STORAGE_STATUS.txt
-
-# Day tracking folders
+*summary*.txt
+log_*.txt
+*.log
+TEST_NUMBERS/
+test_del/
+economical_metrics.md
+millitary_grade.txt
+agentgate_llm_capability_analysis.md
+analysis_minimax.md
+implement_proxy.md
+optimization_path.md
+proxy_sandbox.md
+testing_comm_metric_monitor.txt
+PENDING_REPORTS/
+docs/plans/
 day5/
 home/
 project/
-PENDING_REPORTS/
+future/
+fuzz/
+fuzz_jwt
+loadtest
 
-# Graphify output
+# Tooling noise
+.antigravitycli/
 graphify-out/
-
-# Zig global cache (cross-project)
-# ~/.cache/zig/
-
-# Local config with secrets (never commit)
-config.json
-
-# License server RSA private key (never commit)
-keys/
-
-# Environment secrets (never commit)
-.env
-
+tools/__pycache__/
+__pycache__/
+agent-gate-portable.tar.gz
+docs/adr/*.png

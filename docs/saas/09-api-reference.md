@@ -57,7 +57,7 @@ Main AI proxy endpoint. Accepts Anthropic Messages API format, performs policy c
 | 400 | Invalid request body | `{"type":"error","error":{"type":"invalid_request_error","message":"..."}}` |
 | 401 | Missing `x-api-key` | `{"type":"error","error":{"type":"authentication_error","message":"missing x-api-key header"}}` |
 | 402 | License expired | `{"type":"error","error":{"type":"payment_required","message":"license expired"}}` |
-| 403 | Policy denied | `{"type":"error","error":{"type":"forbidden","message":"tool bash denied by policy block-rm-rf"}}` |
+| 403 | Policy denied | `{"type":"error","error":{"type":"forbidden","message":"tool bash denied by policy block-rm"}}` |
 | 405 | Wrong method | `method not allowed` |
 | 429 | Rate limited | `{"type":"error","error":{"type":"rate_limit_error","message":"..."}}` |
 | 502 | Upstream failure | `"upstream request failed"` |
@@ -84,84 +84,271 @@ Policy engine health check.
 **Method**: `GET`
 
 **Response**: `200 OK`
-**Body**:
-```json
-{
-  "status": "ok",
-  "uptime": 12345,
-  "policies_loaded": 20,
-  "audit_entries": 500
-}
-```
+**Body**: `OK`
 
 ### `GET /denied-requests`
 
-Retrieve denied requests from the audit log.
+Retrieve recent denied requests from the denial tracker.
 
 **URL**: `http://localhost:8081/denied-requests`
 
 **Method**: `GET`
 
+**Query Parameters**:
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `limit` | int | 100 | Max entries (max 1000) |
+| `agent` | hex(64) | — | Filter by agent ID (64 hex chars) |
+| `since` | int | — | Unix timestamp (µs) — only entries after this time |
+
 **Response**: `200 OK`
 **Body**:
 ```json
 {
-  "entries": [
-    {
-      "seq": 1423,
-      "timestamp": "2026-06-02T14:30:00.123456789Z",
-      "agent_id": "a1b2c3d4e5f6...",
-      "tool": "bash",
-      "command_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "decision": "deny",
-      "policy_id": "block-rm-rf",
-      "reason": "rm -rf blocked by policy block-rm-rf",
-      "prev_hash": "abcdef...",
-      "hash": "123456..."
-    }
-  ],
   "total": 42,
-  "merkle_root": "789abc...",
-  "signature": "base64_rsa_signature"
+  "denials": [
+    {
+      "timestamp": 1748800000123456,
+      "agent_id": "a1b2c3d4e5f6...",
+      "path": "/etc/passwd",
+      "method": "read",
+      "policy_id": "block-sensitive-files",
+      "reason": "file_path_denied"
+    }
+  ]
 }
 ```
 
-### `GET /metrics`
+| Field | Type | Description |
+|-------|------|-------------|
+| `total` | int | Total denials since server start |
+| `denials[].timestamp` | int | Unix timestamp in microseconds |
+| `denials[].agent_id` | string | 64-char hex agent fingerprint |
+| `denials[].path` | string | The path that was checked |
+| `denials[].method` | string | HTTP method |
+| `denials[].policy_id` | string | Policy that denied the request |
+| `denials[].reason` | string | Enum reason for denial |
 
-Prometheus-format metrics.
+### `POST /check`
 
-**URL**: `http://localhost:9090/metrics`
+Evaluate a tool invocation against the policy engine.
+
+**URL**: `http://localhost:8081/check`
+
+**Method**: `POST`
+
+**Headers**:
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Content-Type` | ✅ | `application/json` |
+| `X-API-Key` | 🟡 | Required in hosted API mode (`api.enabled: true`) |
+
+**Request Body**:
+
+Supports two formats:
+
+**Legacy format:**
+```json
+{
+  "path": "/api/users",
+  "method": "GET"
+}
+```
+
+**Tool-aware format (recommended):**
+```json
+{
+  "tool": "bash",
+  "command": "ls -la",
+  "path": "/workspace"
+}
+```
+
+**Response**: `200 OK`
+
+```json
+{"allowed": true}
+```
+
+On denial:
+```json
+{"allowed": false, "reason": "policy denied by: block-rm", "policy_id": "block-rm"}
+```
+
+---
+
+### `GET /v1/agents`
+
+List registered agents. Currently returns a static placeholder.
+
+**URL**: `http://localhost:8081/v1/agents`
 
 **Method**: `GET`
 
 **Response**: `200 OK`
-**Headers**: `Content-Type: text/plain; version=0.0.4`
+**Body**: `[]`
+
+---
+
+### `GET /v1/admin/keys`
+
+List API keys (hosted mode only, requires admin auth).
+
+**URL**: `http://localhost:8081/v1/admin/keys`
+
+**Method**: `GET`
+
+**Headers**:
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-Admin-Key` | ✅ | Admin API key |
+
+**Response**: `200 OK`
+
+```json
+{"keys": ["key_abc...", "key_def..."], "total": 2}
+```
+
+**Notes**: Requires `api.enabled: true` in config. If hosted mode is disabled, returns 404.
+
+---
+
+### `POST /v1/admin/keys`
+
+Create a new API key.
+
+**URL**: `http://localhost:8081/v1/admin/keys`
+
+**Method**: `POST`
+
+**Headers**:
+- `Content-Type: application/json`
+- `X-Admin-Key`: Admin API key
+
+**Request Body**:
+```json
+{
+  "name": "my-key",
+  "rate_limit": 100
+}
+```
+
+**Response**: `201 Created`
+
+```json
+{"key": "ag_k8sZ...", "name": "my-key", "rate_limit": 100}
+```
+
+---
+
+### `DELETE /v1/admin/keys`
+
+Revoke an API key.
+
+**URL**: `http://localhost:8081/v1/admin/keys`
+
+**Method**: `DELETE`
+
+**Headers**:
+- `Content-Type: application/json`
+- `X-Admin-Key`: Admin API key
+
+**Request Body**:
+```json
+{
+  "key": "ag_k8sZ..."
+}
+```
+
+**Response**: `200 OK`
+
+```json
+{"revoked": true}
+```
+
+---
+
+### `GET /v1/admin/usage`
+
+Retrieve usage statistics (hosted mode only).
+
+**URL**: `http://localhost:8081/v1/admin/usage`
+
+**Method**: `GET`
+
+**Headers**:
+- `X-Admin-Key`: Admin API key
+
+**Response**: `200 OK`
+
+```json
+{"requests": 1234, "rate_limited": 5, "keys": 3}
+```
+
+---
+
+### `GET /v1/admin/stats`
+
+Server statistics (hosted mode only).
+
+**URL**: `http://localhost:8081/v1/admin/stats`
+
+**Method**: `GET`
+
+**Headers**:
+- `X-Admin-Key`: Admin API key
+
+**Response**: `200 OK`
+
+```json
+{
+  "uptime_seconds": 3600,
+  "total_requests": 5000,
+  "active_keys": 3,
+  "rate_limited": 12
+}
+```
+
+---
+
+### `GET /metrics`
+
+Policy engine metrics in custom key-value format.
+
+**URL**: `http://localhost:8081/metrics`
+
+**Method**: `GET`
+
+**Response**: `200 OK`
+**Headers**: `Content-Type: text/plain`
 
 **Body**:
 ```
-# HELP agentgate_policy_decisions_total Total policy decisions
-# TYPE agentgate_policy_decisions_total counter
-agentgate_policy_decisions_total{decision="allow"} 1500
-agentgate_policy_decisions_total{decision="deny"} 42
-
-# HELP agentgate_policy_latency_microseconds Policy decision latency
-# TYPE agentgate_policy_latency_microseconds histogram
-agentgate_policy_latency_microseconds_bucket{le="10"} 850000
-agentgate_policy_latency_microseconds_bucket{le="50"} 998000
-agentgate_policy_latency_microseconds_bucket{le="+Inf"} 1000000
-
-# HELP agentgate_audit_entries_total Total audit log entries
-# TYPE agentgate_audit_entries_total counter
-agentgate_audit_entries_total 1500
-
-# HELP agentgate_rate_limited_total Total rate-limited requests
-# TYPE agentgate_rate_limited_total counter
-agentgate_rate_limited_total 5
-
-# HELP agentgate_active_agents Currently active agent sessions
-# TYPE agentgate_active_agents gauge
-agentgate_active_agents 3
+requests_total: 42
+allowed: 38
+denied: 4
+active: 2
+histogram_count: 50
+latency_p50: 15
+latency_p90: 45
+latency_p99: 120
 ```
+
+| Field | Description |
+|-------|-------------|
+| `requests_total` | Total requests evaluated |
+| `allowed` | Requests that passed policy |
+| `denied` | Requests blocked by policy |
+| `active` | Current active sessions |
+| `histogram_count` | Samples in latency histogram |
+| `latency_p50` | Median latency (µs) |
+| `latency_p90` | 90th percentile latency (µs) |
+| `latency_p99` | 99th percentile latency (µs) |
+
+**Prometheus scraping**: custom key-value format — convert with a small exporter or consume directly with scripts.
 
 ## LiteLLM Endpoints
 
@@ -194,6 +381,25 @@ Detailed service readiness.
 
 **Response**: `200 OK`
 **Body**: Detailed JSON with per-model status.
+
+## Audit Log
+
+The audit logger (`src/audit/logger.zig`) maintains a **Merkle chain** of every policy decision for compliance and forensics. This is an in-memory ring buffer — not directly exposed via REST.
+
+```
+LogEntry (packed struct):
+  sequence: u64
+  timestamp_us: u64
+  agent_id: [32]u8
+  path_hash: [16]u8
+  decision: u8
+  previous_hash: [16]u8   ← Merkle chain link
+  current_hash: [16]u8    ← sha256(previous_hash || entry_data)
+```
+
+The `/denied-requests` endpoint is a **separate, simplified** view from the denial tracker — it includes event details but no cryptographic hashes.
+
+---
 
 ## Error Codes
 

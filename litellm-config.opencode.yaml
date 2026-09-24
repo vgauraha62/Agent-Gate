@@ -11,13 +11,13 @@ model_list:
     litellm_params:
       model: "openai/deepseek-v4-flash-free"
       api_base: https://opencode.ai/zen/v1
-      api_key: sk-PQmX0Hx6yeqEgopEEdFyk4G2T3AI3R8Q5zrnFg9upoCk3Zfc97aflx1gnbE6kALj
+      api_key: os.environ/OPENCODE_API_KEY
 
   - model_name: "agentgate/deepseek-v4-flash"
     litellm_params:
       model: "openai/deepseek-v4-flash"
       api_base: https://opencode.ai/zen/v1
-      api_key: sk-PQmX0Hx6yeqEgopEEdFyk4G2T3AI3R8Q5zrnFg9upoCk3Zfc97aflx1gnbE6kALj
+      api_key: os.environ/OPENCODE_API_KEY
 
 # ── LiteLLM Engine Settings ──────────────────────────────────────────
 litellm_settings:

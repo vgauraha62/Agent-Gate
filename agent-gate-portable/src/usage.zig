@@ -50,18 +50,20 @@ pub const RateLimitState = struct {
 
     const Self = @This();
 
-    pub fn init(rate_per_second: u32) Self {
+    pub fn init(rate_per_second: u32, now_us: ?i64) Self {
         return Self{
             .tokens = @as(f64, @floatFromInt(rate_per_second)),
-            .last_refill_us = time.microTimestamp(),
+            .last_refill_us = now_us orelse time.microTimestamp(),
             .max_burst = rate_per_second,
         };
     }
 
     /// Try to consume a token. Returns true if allowed.
-    pub fn tryConsume(self: *Self, rate_per_second: u32) bool {
-        const now_us = time.microTimestamp();
-        const elapsed_us = now_us - self.last_refill_us;
+    /// `now_us` is optional — pass `null` to use wall-clock time (normal operation),
+    /// or pass a fixed timestamp for deterministic testing.
+    pub fn tryConsume(self: *Self, rate_per_second: u32, now_us: ?i64) bool {
+        const now = now_us orelse time.microTimestamp();
+        const elapsed_us = now - self.last_refill_us;
         const elapsed_s = @as(f64, @floatFromInt(elapsed_us)) / 1_000_000.0;
 
         // Refill tokens based on elapsed time
@@ -69,7 +71,7 @@ pub const RateLimitState = struct {
             @as(f64, @floatFromInt(self.max_burst)),
             self.tokens + elapsed_s * @as(f64, @floatFromInt(rate_per_second)),
         );
-        self.last_refill_us = now_us;
+        self.last_refill_us = now;
 
         if (self.tokens >= 1.0) {
             self.tokens -= 1.0;
@@ -131,7 +133,9 @@ pub const UsageTracker = struct {
     /// Record a request and check rate limit.
     /// Makes copies of path and method strings.
     /// Returns true if the request is within rate limits.
-    pub fn recordAndCheck(self: *Self, key_hash: [32]u8, rate_limit: u32, record: UsageRecord) bool {
+    /// `now_us` is optional — pass `null` to use wall-clock time,
+    /// or pass a fixed timestamp for deterministic testing.
+    pub fn recordAndCheck(self: *Self, key_hash: [32]u8, rate_limit: u32, record: UsageRecord, now_us: ?i64) bool {
         if (!self.enabled) return true;
 
         self.mutex.lock();
@@ -141,9 +145,9 @@ pub const UsageTracker = struct {
         if (self.rate_limiting_enabled and rate_limit > 0) {
             var state = self.rate_limits.getOrPut(key_hash) catch return true;
             if (!state.found_existing) {
-                state.value_ptr.* = RateLimitState.init(rate_limit);
+                state.value_ptr.* = RateLimitState.init(rate_limit, now_us);
             }
-            if (!state.value_ptr.tryConsume(rate_limit)) {
+            if (!state.value_ptr.tryConsume(rate_limit, now_us)) {
                 return false; // Rate limited
             }
         }
@@ -270,7 +274,7 @@ test "UsageTracker: basic recording" {
         .latency_us = 42,
     };
 
-    const allowed = tracker.recordAndCheck(key_hash, 100, record);
+    const allowed = tracker.recordAndCheck(key_hash, 100, record, null);
     try std.testing.expect(allowed);
 
     const stats = tracker.getKeyStats(key_hash);
@@ -290,33 +294,53 @@ test "UsageTracker: rate limiting kicks in" {
     // Set rate limit to 2 per second
     const rate: u32 = 2;
 
-    // First 2 should be allowed
+    // Use deterministic virtual time so this test is never flaky.
+    // At t=0, the bucket starts full (2 tokens).
+    // Call 1 @ t=0: tokens=2 → consume → tokens=1  ✓ allowed
+    // Call 2 @ t=0: tokens=1 → consume → tokens=0  ✓ allowed
+    // Call 3 @ t=0: tokens=0 → no refill → denied  ✓ denied
+    const t0: i64 = 0;
+
     for (0..2) |i| {
         const record = UsageRecord{
             .key_hash = key_hash,
-            .timestamp_us = std.time.microTimestamp(),
+            .timestamp_us = t0,
             .path = "/v1/check",
             .method = "POST",
             .allowed = true,
             .status = 200,
             .latency_us = @as(u64, @intCast(i)),
         };
-        const allowed = tracker.recordAndCheck(key_hash, rate, record);
+        const allowed = tracker.recordAndCheck(key_hash, rate, record, t0);
         try std.testing.expect(allowed);
     }
 
-    // Third should be rate limited
+    // Third call at same instant → rate limited
     const record = UsageRecord{
         .key_hash = key_hash,
-        .timestamp_us = std.time.microTimestamp(),
+        .timestamp_us = t0,
         .path = "/v1/check",
         .method = "POST",
         .allowed = false,
         .status = 429,
         .latency_us = 0,
     };
-    const allowed = tracker.recordAndCheck(key_hash, rate, record);
+    const allowed = tracker.recordAndCheck(key_hash, rate, record, t0);
     try std.testing.expect(!allowed);
+
+    // After 1 second, bucket refills → call should be allowed again
+    const t1: i64 = 1_000_000; // 1 second in microseconds
+    const future_record = UsageRecord{
+        .key_hash = key_hash,
+        .timestamp_us = t1,
+        .path = "/v1/check",
+        .method = "POST",
+        .allowed = true,
+        .status = 200,
+        .latency_us = 0,
+    };
+    const future_allowed = tracker.recordAndCheck(key_hash, rate, future_record, t1);
+    try std.testing.expect(future_allowed);
 }
 
 test "UsageTracker: disabled tracking allows all" {
@@ -338,7 +362,7 @@ test "UsageTracker: disabled tracking allows all" {
         .status = 200,
         .latency_us = 10,
     };
-    const allowed = tracker.recordAndCheck(key_hash, 0, record);
+    const allowed = tracker.recordAndCheck(key_hash, 0, record, null);
     try std.testing.expect(allowed);
 }
 
@@ -362,7 +386,7 @@ test "UsageTracker: global stats" {
             .allowed = i % 2 == 0,
             .status = if (i % 2 == 0) @as(u16, 200) else 403,
             .latency_us = @as(u64, @intCast(i * 10)),
-        });
+        }, null);
     }
     for (0..3) |_| {
         _ = tracker.recordAndCheck(key2, 1000, .{
@@ -373,7 +397,7 @@ test "UsageTracker: global stats" {
             .allowed = true,
             .status = 200,
             .latency_us = 5,
-        });
+        }, null);
     }
 
     const global = tracker.getGlobalStats();
